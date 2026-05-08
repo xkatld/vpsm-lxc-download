@@ -21,7 +21,7 @@ def export_images():
             continue
             
         print(f"EXPORTING: {alias}")
-        target_path = os.path.join(project_dir, f"{alias}.tar.gz")
+        target_path = os.path.join(project_dir, alias)
         
         try:
             # 执行导出
