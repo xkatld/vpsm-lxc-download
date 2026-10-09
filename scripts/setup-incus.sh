@@ -41,12 +41,17 @@ YAML
 sudo iptables -I FORWARD 1 -i incusbr0 -j ACCEPT
 sudo iptables -I FORWARD 1 -o incusbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-if ! sudo incus remote get-url images >/dev/null 2>&1; then
+# Incus 6.0 (Ubuntu 24.04) has no `remote get-url` command. Query the
+# supported JSON listing instead. Keep this outside the conditional so command
+# or parsing failures stop the script rather than being mistaken for absence.
+remote_names=$(sudo incus remote list --format=json | python3 -c \
+  'import json, sys; print("\n".join(json.load(sys.stdin)))')
+if ! grep -Fxq images <<<"$remote_names"; then
   sudo incus remote add images https://images.linuxcontainers.org \
     --protocol=simplestreams --public
 fi
 sudo incus version
-sudo incus remote get-url images
+sudo incus remote list --format=json
 sudo incus storage list
 sudo incus network list
 df -h

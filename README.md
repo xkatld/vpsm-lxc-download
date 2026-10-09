@@ -119,6 +119,20 @@ ARM64 主机使用 `--architecture arm64`。使用拥有 Incus 管理权限的�
 
 ## 失败与资源清理
 
+### Incus 初始化时提示 images 源已存在
+
+如果旧版工作流在 `Install and initialize Incus` 阶段报错：
+
+```text
+Error: Remote images exists as <https://images.linuxcontainers.org>
+```
+
+原因是旧脚本使用了不存在的 `incus remote get-url` 命令，把命令失败误判为源不存在，然后重复添加默认的 `images` 源。现改用 Incus 6.0 支持的 `incus remote list --format=json` 精确检查源名；查询失败时直接报错，不再尝试添加。
+
+修复需要提交并推送后，通过新的 push 或手动触发构建来验证。不要只点旧运行的 **Re-run jobs**：它仍使用旧提交，不会包含修复。
+
+### 资源与诊断
+
 - `fail-fast: false`：一个版本失败不会取消其他版本；最终汇总仍标记失败，不能假装全量成功。
 - 正常结束、异常和可处理的终止信号会清理本次创建的资源；runner 被强杀时由 GitHub 销毁临时 VM 兜底。
 - 构建使用唯一资源前缀，不再扫描和操作所有容器；不按共享基础镜像 fingerprint 删除其他 alias 指向的镜像。
