@@ -155,9 +155,8 @@ class ManifestTests(HermeticTestCase):
                 with self.subTest(distro=distro, release=release, architecture=architecture):
                     self.assertEqual(spec.image_alias, f"{distro}-{release}".lower())
                     self.assertEqual(spec.remote_path(), f"images:{distro}/{release}/{architecture}")
-                    for flavor in ("all", "lite"):
-                        version = display.get((distro, release), release).replace(".", "").lower()
-                        self.assertEqual(spec.container_name(flavor), f"{distro}{version}-{flavor}-{architecture}-lxc")
+                    version = display.get((distro, release), release).replace(".", "").lower()
+                    self.assertEqual(spec.container_name(), f"{distro}{version}-{architecture}-lxc")
 
 
 class CliTests(HermeticTestCase):
@@ -291,7 +290,7 @@ class PreflightAndIdentityTests(HermeticTestCase):
         self.assertEqual(len({pipeline.run_id for pipeline in pipelines}), 3)
         for pipeline in pipelines:
             self.assertRegex(pipeline.run_id, r"^[a-z0-9-]+$")
-            self.assertTrue(pipeline.container_name(self.spec, "all").startswith(f"vpsm-{pipeline.run_id}-"))
+            self.assertTrue(pipeline.container_name(self.spec).startswith(f"vpsm-{pipeline.run_id}-"))
             self.assertEqual(pipeline.base_alias(self.spec), pipeline.resource_name(f"{self.spec.image_alias}-{self.spec.architecture}"))
             self.assertTrue(all(len(name) <= 63 for name in pipeline.containers))
             self.assertEqual(pipeline.created_containers, [])
@@ -392,16 +391,50 @@ class SafeCommandTests(HermeticTestCase):
                         major = release.split("-", 1)[0]
                         self.assertIn(f"https://dl.fedoraproject.org/pub/epel/epel-release-latest-{major}.noarch.rpm", command)
 
-    def test_install_all_packages_never_modifies_lite_variant(self):
+    def test_ca_bundle_is_explicitly_installed_refreshed_and_nonempty(self):
+        for architecture in RUNNERS:
+            for distro, release in RELEASES:
+                with self.subTest(architecture=architecture, distro=distro, release=release):
+                    command = build_pipeline.Pipeline.package_install_command(spec_for(distro, release, architecture))
+                    self.assertIn("ca-certificates", command)
+                    refresh, bundle = (("update-ca-trust extract", "/etc/pki/tls/certs/ca-bundle.crt")
+                                       if distro in {"almalinux", "centos"} else
+                                       ("update-ca-certificates", "/etc/ssl/certs/ca-certificates.crt"))
+                    self.assertLess(command.index("ca-certificates"), command.index(refresh))
+                    self.assertTrue(command.endswith(f"{refresh}\ntest -s {bundle}"))
+                    self.assertTrue(command.startswith("set -eu\n"))
+                    self.assertNotIn("|| true", command)
+
+    def test_image_readme_uses_current_notice_domain(self):
+        self.assertEqual(build_pipeline.README_CONTENT,
+                         "本系统为vpsm91.com构建,本文件无实际作用可随意处理。")
         pipeline = self.pipeline()
         with patch.object(pipeline, "exec_container", return_value=completed()) as execute:
-            pipeline.install_all_packages()
+            pipeline.write_readmes()
         execute.assert_called_once()
-        self.assertEqual(execute.call_args.args[0], pipeline.container_name(self.spec, "all"))
+        args, kwargs = execute.call_args
+        self.assertEqual(args[0], pipeline.container_name(self.spec))
+        self.assertIn("vpsm91.com", args[1])
+        self.assertNotIn("vpsm.link", args[1])
+        self.assertIn("> /root/README.md", args[1])
+        self.assertTrue(kwargs["quiet"])
+
+    def test_install_common_packages_targets_the_single_image(self):
+        self.assertEqual(build_pipeline.COMMON_PACKAGES.split(),
+                         ["bash", "git", "unzip", "screen", "wget", "curl", "sudo", "nano", "ca-certificates"])
+        for architecture in RUNNERS:
+            for distro, release in RELEASES:
+                with self.subTest(architecture=architecture, distro=distro, release=release):
+                    spec = spec_for(distro, release, architecture)
+                    pipeline = self.pipeline(specs=[spec])
+                    self.assertEqual(pipeline.containers, [pipeline.container_name(spec)])
+                    with patch.object(pipeline, "exec_container", return_value=completed()) as execute:
+                        pipeline.install_common_packages()
+                    execute.assert_called_once_with(pipeline.container_name(spec), pipeline.package_install_command(spec))
 
 
 class SetupReadinessTests(HermeticTestCase):
-    def test_every_release_recovers_index_before_installing_each_variant(self):
+    def test_every_release_recovers_index_before_installing_the_single_image(self):
         self.fake_clock()
         for architecture in RUNNERS:
             for distro, release in RELEASES:
@@ -605,7 +638,7 @@ class SetupDiagnosticTests(HermeticTestCase):
         pipeline = self.pipeline(setup_diagnostics=True)
         self.subprocess.side_effect = subprocess.CalledProcessError(1, ["ARGV"], output="STDOUT", stderr="PRIVATE_STDERR")
         for action in (lambda: pipeline.incus(["version"]),
-                       lambda: pipeline.install_all_packages(), lambda: pipeline.cleanup_containers()):
+                       lambda: pipeline.install_common_packages(), lambda: pipeline.cleanup_containers()):
             with self.assertRaises(build_pipeline.IncusCommandError) as raised:
                 action()
             self.assertEqual(str(raised.exception), "external command failed (exit 1)")
@@ -651,7 +684,7 @@ class OwnershipTests(HermeticTestCase):
         with patch.object(pipeline, "incus", side_effect=[completed(), RuntimeError("launch failed")]):
             with self.assertRaises(RuntimeError):
                 pipeline.launch_containers()
-        self.assertEqual(pipeline.created_containers, [pipeline.container_name(self.spec, "all")])
+        self.assertEqual(pipeline.created_containers, [pipeline.container_name(self.spec)])
 
     def test_init_failure_does_not_record_container(self):
         pipeline = self.pipeline()
@@ -660,12 +693,16 @@ class OwnershipTests(HermeticTestCase):
                 pipeline.launch_containers()
         self.assertEqual(pipeline.created_containers, [])
 
-    def test_failed_second_init_preserves_first_owned_container(self):
+    def test_launch_creates_and_starts_exactly_one_container(self):
         pipeline = self.pipeline()
-        with patch.object(pipeline, "incus", side_effect=[completed(), completed(), RuntimeError("init failed")]), patch.object(pipeline, "wait_for_container"):
-            with self.assertRaises(RuntimeError):
-                pipeline.launch_containers()
-        self.assertEqual(pipeline.created_containers, [pipeline.container_name(self.spec, "all")])
+        name = pipeline.container_name(self.spec)
+        with patch.object(pipeline, "incus", return_value=completed()) as incus, patch.object(pipeline, "wait_for_container") as wait:
+            pipeline.launch_containers()
+        self.assertEqual(incus.call_args_list, [
+            call(["init", pipeline.base_alias(self.spec), name]), call(["start", name]),
+        ])
+        wait.assert_called_once_with(name)
+        self.assertEqual(pipeline.created_containers, [name])
 
     def test_final_cleanup_only_deletes_recorded_owned_resources(self):
         pipeline = self.pipeline()
@@ -744,10 +781,10 @@ class ReadinessAndSshTests(HermeticTestCase):
     def test_ssh_retries_missing_ip_and_login_then_succeeds(self):
         pipeline = self.pipeline(ssh_timeout=20)
         _, sleep = self.fake_clock()
-        self.subprocess.side_effect = [completed(returncode=255), completed("root\n"), completed("root\n")]
-        with patch.object(pipeline, "container_ip", side_effect=[None, "10.0.0.2", "10.0.0.2", "10.0.0.3"]):
+        self.subprocess.side_effect = [completed(returncode=255), completed("root\n")]
+        with patch.object(pipeline, "container_ip", side_effect=[None, "10.0.0.2", "10.0.0.2"]):
             pipeline.test_ssh()
-        self.assertEqual(self.subprocess.call_count, 3)
+        self.assertEqual(self.subprocess.call_count, 2)
         self.assertGreaterEqual(sleep.call_count, 2)
         for item in self.subprocess.call_args_list:
             self.assertEqual(item.kwargs["env"]["SSHPASS"], self.password)
@@ -759,10 +796,10 @@ class ReadinessAndSshTests(HermeticTestCase):
     def test_ssh_retries_subprocess_timeout(self):
         pipeline = self.pipeline(ssh_timeout=20)
         self.fake_clock()
-        self.subprocess.side_effect = [subprocess.TimeoutExpired(["sshpass"], 1), completed("root\n"), completed("root\n")]
+        self.subprocess.side_effect = [subprocess.TimeoutExpired(["sshpass"], 1), completed("root\n")]
         with patch.object(pipeline, "container_ip", return_value="10.0.0.2"):
             pipeline.test_ssh()
-        self.assertEqual(self.subprocess.call_count, 3)
+        self.assertEqual(self.subprocess.call_count, 2)
 
     def test_ssh_deadline_rejects_missing_ip_or_non_root_login(self):
         for ip, stdout in ((None, ""), ("10.0.0.2", "not-root\n")):
@@ -889,11 +926,11 @@ class SanitizationAndExportTests(HermeticTestCase):
                 callback, exports = self.export_callback(mode)
                 with patch.object(pipeline, "incus", side_effect=callback), patch.object(pipeline, "write_checksums", wraps=pipeline.write_checksums) as checksums:
                     pipeline.publish_and_export()
-                expected = [self.spec.container_name(flavor) + suffix for flavor in ("all", "lite") for suffix in suffixes]
+                expected = [self.spec.container_name() + suffix for suffix in suffixes]
                 self.assertCountEqual(pipeline.exported_files, expected)
                 self.assertCountEqual(pipeline.created_published_aliases, pipeline.containers)
-                self.assertEqual(checksums.call_count, 2)
-                self.assertEqual(len(exports), 2)
+                self.assertEqual(checksums.call_count, 1)
+                self.assertEqual(len(exports), 1)
                 self.assertTrue(all(not prefix.parent.exists() for prefix in exports))
                 self.assertCountEqual([path.name for path in self.output.iterdir()], [*expected, "SHA256SUMS"])
                 actual_checksums = {}
@@ -915,18 +952,16 @@ class SanitizationAndExportTests(HermeticTestCase):
                 self.assertEqual(list(self.output.iterdir()), [])
                 self.assertTrue(all(not prefix.parent.exists() for prefix in exports))
 
-    def test_failed_second_export_keeps_only_first_verified_files_and_checksums(self):
+    def test_failed_export_does_not_promote_partial_files_or_checksums(self):
         pipeline = self.prepared_pipeline()
-        callback, exports = self.export_callback(fail_export=2)
+        callback, exports = self.export_callback(fail_export=1)
         with patch.object(pipeline, "incus", side_effect=callback):
             with self.assertRaises(RuntimeError):
                 pipeline.publish_and_export()
-        expected = self.spec.container_name("all") + ".tar.xz"
-        self.assertEqual(pipeline.exported_files, [expected])
-        self.assertCountEqual([path.name for path in self.output.iterdir()], [expected, "SHA256SUMS"])
-        self.assertIn(expected, (self.output / "SHA256SUMS").read_text())
-        self.assertNotIn(self.spec.container_name("lite"), (self.output / "SHA256SUMS").read_text())
-        self.assertTrue(all(not prefix.parent.exists() for prefix in exports))
+        self.assertEqual(pipeline.exported_files, [])
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(len(exports), 1)
+        self.assertFalse(exports[0].parent.exists())
 
     def test_publish_failure_does_not_record_uncreated_alias(self):
         pipeline = self.prepared_pipeline()
@@ -951,12 +986,14 @@ class SanitizationAndExportTests(HermeticTestCase):
         self.assertEqual(summary["architecture"], "amd64")
         self.assertEqual(summary["exported_files"], ["verified.tar.xz"])
         self.assertEqual(summary["status"], "success")
+        self.assertEqual(len(summary["images"]), 1)
+        self.assertNotIn("variants", summary)
         self.assertNotIn(self.password, json.dumps(summary))
 
 
 class RunLifecycleTests(HermeticTestCase):
     STAGES = (
-        "download_images", "launch_containers", "setup_containers", "install_all_packages",
+        "download_images", "launch_containers", "setup_containers", "install_common_packages",
         "write_readmes", "test_ssh", "cleanup_containers", "publish_and_export",
     )
 

@@ -68,7 +68,7 @@ jobs:
           persist-credentials: false
       - name: Install and initialize Incus
         run: bash scripts/setup-incus.sh
-      - name: Build both all and lite images
+      - name: Build image with common packages
         shell: bash
         run: |
           set -euo pipefail
@@ -133,7 +133,7 @@ jobs:
           name: build-matrix
           path: expected
       # Download/verify/delete one artifact at a time instead of filling a runner
-      # with all 60 images. Image artifacts remain available from this run.
+      # with all 30 images. Image artifacts remain available from this run.
       - name: Verify checksums and expected outputs
         env:
           GH_TOKEN: ${{ github.token }}

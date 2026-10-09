@@ -1,4 +1,6 @@
+import contextlib
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -10,35 +12,63 @@ from scripts.verify_artifacts import main, verify_artifact
 
 class ArtifactTests(unittest.TestCase):
     row = {"distro": "alpine", "release": "3.24", "architecture": "amd64"}
+    prefix = "alpine324-amd64-lxc"
 
-    def fixture(self, root):
-        files = [f"alpine324-{flavor}-amd64-lxc.tar.xz" for flavor in ("all", "lite")]
+    def fixture(self, root, files=None, row=None):
+        if files is None:
+            files = [self.prefix + ".tar.gz"]
+        row = self.row if row is None else row
         for name in files:
             (root / name).write_bytes(b"test image")
-        summary = {"status": "success", "architecture": "amd64", "images": [self.row], "exported_files": files}
+        summary = {"status": "success", "architecture": row["architecture"], "images": [row], "exported_files": files}
         (root / "build-summary.json").write_text(json.dumps(summary))
         digest = hashlib.sha256(b"test image").hexdigest()
         (root / "SHA256SUMS").write_text("".join(f"{digest}  {name}\n" for name in files))
         return files
 
-    def test_success(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self.fixture(root)
-            self.assertEqual(verify_artifact(root, self.row), 2)
+    def test_success_with_exact_expected_names(self):
+        cases = [
+            (self.row, "alpine324-amd64-lxc.tar.gz"),
+            ({"distro": "debian", "release": "bookworm", "architecture": "arm64"}, "debian12-arm64-lxc.tar.gz"),
+            ({"distro": "centos", "release": "9-Stream", "architecture": "amd64"}, "centos9-stream-amd64-lxc.tar.gz"),
+        ]
+        for row, filename in cases:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.fixture(root, [filename], row)
+                self.assertEqual(verify_artifact(root, row), 1)
 
-    def test_incus_extensionless_split_exports(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            files = [f"alpine324-{flavor}-amd64-lxc{suffix}"
-                     for flavor in ("all", "lite") for suffix in ("", ".root")]
-            for name in files:
-                (root / name).write_bytes(b"test image")
-            summary = {"status": "success", "architecture": "amd64", "images": [self.row], "exported_files": files}
-            (root / "build-summary.json").write_text(json.dumps(summary))
-            digest = hashlib.sha256(b"test image").hexdigest()
-            (root / "SHA256SUMS").write_text("".join(f"{digest}  {name}\n" for name in files))
-            self.assertEqual(verify_artifact(root, self.row), 4)
+    def test_supported_single_image_export_sets(self):
+        suffixes = [".tar", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst"]
+        cases = [[suffix] for suffix in suffixes] + [["", ".root"]]
+        cases += [[metadata, ".rootfs" + rootfs] for metadata in suffixes for rootfs in suffixes]
+        for extensions in cases:
+            with self.subTest(extensions=extensions), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                files = [self.prefix + suffix for suffix in extensions]
+                self.fixture(root, files)
+                self.assertEqual(verify_artifact(root, self.row), len(files))
+
+    def test_incomplete_or_multiple_image_export_sets_fail(self):
+        for suffixes in ([""], [".root"], [".rootfs.tar.xz"], [".tar.gz", ".tar.xz"],
+                         [".tar.gz", ".root"], [".tar.gz", ".rootfs.tar.xz", ".root"], [".unexpected"]):
+            with self.subTest(suffixes=suffixes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.fixture(root, [self.prefix + suffix for suffix in suffixes])
+                with self.assertRaisesRegex(ValueError, "unexpected export file set"):
+                    verify_artifact(root, self.row)
+
+    def test_old_flavors_and_inexact_prefixes_fail(self):
+        for filename in ("alpine324-all-amd64-lxc.tar.gz", "alpine324-lite-amd64-lxc.tar.gz",
+                         "alpine324-arm64-lxc.tar.gz", "alpine323-amd64-lxc.tar.gz",
+                         "alpine324-amd64-lxc-extra.tar.gz", "alpine324-amd64-lxc2.tar.gz"):
+            for include_expected in (False, True):
+                with self.subTest(filename=filename, include_expected=include_expected), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    files = [filename] + ([self.prefix + ".tar.gz"] if include_expected else [])
+                    self.fixture(root, files)
+                    with self.assertRaisesRegex(ValueError, "unexpected image export"):
+                        verify_artifact(root, self.row)
 
     def test_corrupt_export_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,13 +78,42 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 verify_artifact(root, self.row)
 
-    def test_missing_flavor_fails(self):
+    def test_missing_export_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             files = self.fixture(root)
             (root / files[0]).unlink()
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "missing or empty"):
                 verify_artifact(root, self.row)
+
+    def test_empty_or_duplicate_export_list_fails(self):
+        for files in ([], [self.prefix + ".tar.gz"] * 2):
+            with self.subTest(files=files), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.fixture(root, files)
+                with self.assertRaisesRegex(ValueError, "missing or duplicate"):
+                    verify_artifact(root, self.row)
+
+    def test_checksum_set_must_exactly_match_exported_files(self):
+        for change in ("missing", "extra", "renamed", "duplicate", "malformed"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                files = self.fixture(root, [self.prefix, self.prefix + ".root"])
+                path = root / "SHA256SUMS"
+                lines = path.read_text().splitlines(keepends=True)
+                if change == "missing":
+                    lines.pop()
+                elif change == "extra":
+                    lines.append(lines[0].replace(files[0], "stale.tar.gz"))
+                elif change == "renamed":
+                    lines[0] = lines[0].replace(files[0], "stale.tar.gz")
+                elif change == "duplicate":
+                    lines.append(lines[0])
+                else:
+                    lines[0] = "invalid checksum entry\n"
+                path.write_text("".join(lines))
+                with self.assertRaisesRegex(ValueError, "checksum"):
+                    verify_artifact(root, self.row)
 
     def test_extra_file_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,15 +146,18 @@ class ArtifactTests(unittest.TestCase):
             matrix = Path(directory) / "matrix.json"
             matrix.write_text(json.dumps({"include": [self.row]}))
             downloaded = []
+            output = io.StringIO()
 
             def download(command, **kwargs):
                 self.assertIn("--name", command)
                 root = Path(command[command.index("--dir") + 1])
+                self.assertEqual(list(root.iterdir()), [])
                 downloaded.append(root)
                 self.fixture(root)
 
             with patch("sys.argv", ["verify", "--matrix", str(matrix), "--run-id", "123"]), \
                  patch("scripts.verify_artifacts.subprocess.run", side_effect=download), \
-                 patch.dict("os.environ", {}, clear=True):
+                 patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(output):
                 self.assertEqual(main(), 0)
+            self.assertIn("Verified 1 architecture/version jobs, 1 images, 1 export files.", output.getvalue())
             self.assertFalse(downloaded[0].exists())

@@ -2,7 +2,7 @@
 
 使用 **一个 GitHub Actions 工作流**，在 GitHub-hosted Linux runner 上原生构建 x86_64（`amd64`）和 ARM64（`arm64`）Incus/LXC 容器镜像。不需要自建 runner，不需要预装 Incus，也不需要配置构建密码 Secret。
 
-> 当前包含完整流程代码及本地单元测试，尚未在本仓库的 GitHub Actions 上完成真实双架构构建验收。首次运行可能需要根据 runner 网络、上游软件仓库和镜像变化排障。
+> 旧双规格流水线已通过真实双架构构建；当前改为每个版本/架构只构建一份完整镜像，不再生成 lite，文件名也不含 all。此单规格改动仍需新的 Actions 实测。镜像身份初始化等验收问题尚未解决，不应将构建通过等同于生产模板验收通过。
 
 ## 镜像范围
 
@@ -16,8 +16,9 @@
 
 - 15 个版本 × 2 种架构 = **30 条基础镜像记录**，以 `镜像.md` 为准。
 - 上游 variant 仅使用 `default`，并要求支持 Incus container。
-- 每条记录构建 `all` 和 `lite`，共 **60 个目标镜像**。
-- `all` 安装 `bash git unzip screen wget curl sudo nano`；`lite` 配置 SSH，不添加这批软件。
+- 每条记录只构建一份完整镜像，共 **30 个目标镜像**；不再区分 all/lite。
+- 所有镜像均配置 SSH，并安装 `bash git unzip screen wget curl sudo nano ca-certificates`：保留原 8 个常用工具，显式补齐 HTTPS CA 证书包。
+- 安装后刷新系统 CA 信任库并检查证书包非空，失败即中止；这不等于对任意外部站点的 HTTPS 连通性验收。
 - CentOS Stream 不是传统 CentOS Linux；Debian Forky 是开发分支，不能将整张清单称为“全 LTS”。
 - 本项目构建容器，不构建 Incus VM。x86 指 x86_64，不含 32 位 i386。
 
@@ -33,7 +34,7 @@ build：30 个矩阵任务（最多同时执行 6 个）
     └─ arm64：ubuntu-24.04-arm
     每个任务：
     自动安装 Incus → 初始化存储与 NAT/DHCP 网络
-    → 下载一个基础镜像 → 启动 all/lite 容器
+    → 下载一个基础镜像 → 启动一个构建容器
     → 配置 SSH → 安装软件 → 写入说明 → SSH 登录测试
     → 清理缓存与测试凭据 → 停止、发布为本地 Incus 镜像
     → 导出、生成 SHA256SUMS 和构建报告 → 清理临时资源
@@ -58,7 +59,17 @@ images-alpine-3.24-amd64
 images-alpine-3.24-arm64
 ```
 
-每份 Artifact 包含 `all/lite` 导出文件、`SHA256SUMS`、`build-summary.json`。Incus 可能导出统一文件或 metadata/rootfs 分离文件，导入时必须保留配套文件。当前 Artifact 保留 **7 天**。
+每份 Artifact 包含一个目标镜像的导出文件、`SHA256SUMS`、`build-summary.json`。导出名称不含 `all` 或 `lite`，例如：
+
+```text
+alpine324-amd64-lxc.tar.gz
+debian12-arm64-lxc.tar.gz
+centos9-stream-amd64-lxc.tar.gz
+```
+
+Incus 可能导出统一文件或 metadata/rootfs 分离文件；一个镜像不一定对应一个物理文件，导入时必须保留配套文件。当前 Artifact 保留 **7 天**。旧运行的双规格产物不会被此修改重命名或删除；新校验器只接受单规格名称，不混用新旧产物。
+
+旧双规格产物并非完全等大：例如 amd64 的 Alpine 3.24 约 18.1/9.5 MiB，Ubuntu noble 约 160.9/137.7 MiB（原 all/lite，来自运行 `37944528646`）。选择单规格是为了减少重复构建和维护；按该次实际导出大小计算，去掉 lite 可减少约 **44.5%** 的总产物字节数，但不能保证构建耗时等比例下降。
 
 这里的“发布镜像”指 `incus publish`，**不是自动创建 GitHub Release**。当前完整流程终点是可下载并经过校验的 Actions Artifacts。
 
@@ -146,6 +157,12 @@ SSH 安装配置拆分为具名步骤。工作流启用 `--setup-diagnostics`，
 - 构建使用唯一资源前缀，不再扫描和操作所有容器；不按共享基础镜像 fingerprint 删除其他 alias 指向的镜像。
 - 失败任务尝试上传独立 `diagnostics-*` Artifact。只有完整成功的任务上传镜像产物。
 - 清单中的 Build date 是来源快照日期，不是镜像版本锁定；实际下载使用上游可变 alias，不保证每次字节一致。
+
+## 镜像验收
+
+交付验收必须确认 **IPv4/IPv6 双栈**，两种原生架构均需覆盖。对实际导出镜像重新导入后，分别测试地址/路由、A/AAAA 解析、强制 IPv4/IPv6 的 SSH 与 HTTPS，以及重启后的持久性。完整标准见 [镜像交付验收要求](docs/image-acceptance.md)。
+
+**当前双栈尚未验收：** 构建网桥设置为 `ipv6.address: none`，现有 SSH 测试仅使用 IPv4。runner 缺少公网 IPv6 时必须标记环境阻塞，不得将跳过视为通过，也不能用内网 IPv6 成功代替公网双栈结论。
 
 ## 文件结构
 

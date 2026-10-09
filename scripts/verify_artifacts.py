@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from build_pipeline import ImageSpec  # noqa: E402
+from build_pipeline import ImageSpec, valid_export_suffixes  # noqa: E402
 
 
 def sha256(path: Path) -> str:
@@ -41,15 +41,11 @@ def verify_artifact(root: Path, expected: dict) -> int:
         if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
             raise ValueError(f"missing or empty export: {name}")
     spec = ImageSpec(expected["distro"], expected["release"], expected["architecture"], "default", "snapshot")
-    prefixes = [spec.container_name(flavor) for flavor in ("all", "lite")]
-
-    def belongs(name, prefix):
-        return name == prefix or name.startswith(prefix + ".")
-
-    if not all(any(belongs(name, prefix) for name in files) for prefix in prefixes):
-        raise ValueError("both all and lite exports are required")
-    if any(not any(belongs(name, prefix) for prefix in prefixes) for name in files):
+    prefix = spec.container_name()
+    if any(not (name == prefix or name.startswith(prefix + ".")) for name in files):
         raise ValueError("unexpected image export")
+    if not valid_export_suffixes({name[len(prefix):] for name in files}):
+        raise ValueError("unexpected export file set")
     checksums = {}
     for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
         match = re.fullmatch(r"([0-9a-f]{64}) [ *](.+)", line)
@@ -88,7 +84,7 @@ def main() -> int:
             count = verify_artifact(Path(directory), row)
             total += count
             print(f"Verified {name}: {count} files")
-    report = f"Verified {len(rows)} architecture/version jobs, {len(rows) * 2} images, {total} export files."
+    report = f"Verified {len(rows)} architecture/version jobs, {len(rows)} images, {total} export files."
     print(report)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:

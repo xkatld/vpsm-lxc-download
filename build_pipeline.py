@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one native Incus image spec (all + lite) on a hosted Linux runner.
+"""Build one native Incus image with common packages on a hosted Linux runner.
 
 --matrix is read-only and needs neither Incus nor credentials. Build passwords
 are random, temporary test credentials; published images have root locked.
@@ -33,9 +33,8 @@ from typing import Sequence
 ARCHITECTURE = "arm64"  # Backwards-compatible load_manifest default only.
 RUNNERS = {"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"}
 NATIVE_ARCHITECTURES = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
-VARIANTS = ("all", "lite")
-COMMON_PACKAGES = "bash git unzip screen wget curl sudo nano"
-README_CONTENT = "本系统为vpsm.link构建,本文件无实际作用可随意处理。"
+COMMON_PACKAGES = "bash git unzip screen wget curl sudo nano ca-certificates"
+README_CONTENT = "本系统为vpsm91.com构建,本文件无实际作用可随意处理。"
 RELEASE_DISPLAY = {
     "debian": {"bookworm": "12", "forky": "14", "trixie": "13"},
     "ubuntu": {"jammy": "2204", "noble": "2404", "resolute": "2604"},
@@ -59,9 +58,9 @@ class ImageSpec:
     def display_release(self) -> str:
         return RELEASE_DISPLAY.get(self.distro, {}).get(self.release, self.release)
 
-    def container_name(self, flavor: str) -> str:
+    def container_name(self) -> str:
         release = self.display_release.replace(".", "")
-        return f"{self.distro}{release}-{flavor}-{self.architecture}-lxc".lower()
+        return f"{self.distro}{release}-{self.architecture}-lxc".lower()
 
     def remote_path(self) -> str:
         return f"images:{self.distro}/{self.release}/{self.architecture}"
@@ -97,6 +96,17 @@ def load_manifest(path: Path, architecture: str = ARCHITECTURE) -> list[ImageSpe
     if not specs:
         raise ValueError(f"no {architecture}/default Incus container images found")
     return specs
+
+
+def valid_export_suffixes(suffixes: set[str]) -> bool:
+    """Accept exactly one complete unified or split Incus image export."""
+    archive_suffixes = {".tar", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst"}
+    unified = len(suffixes) == 1 and suffixes.issubset(archive_suffixes)
+    split = suffixes == {"", ".root"}
+    # Also tolerate named split archives from older CLI versions.
+    named_split = any(suffixes == {ext, ".rootfs" + root_ext}
+                      for ext in archive_suffixes for root_ext in archive_suffixes)
+    return unified or split or named_split
 
 
 def shell_quote(value: str) -> str:
@@ -143,15 +153,15 @@ class Pipeline:
         suffix = name if len(self.resource_prefix + name) <= 63 else name[:16] + "-" + hashlib.sha256(name.encode()).hexdigest()[:8]
         return self.resource_prefix + suffix
 
-    def container_name(self, spec: ImageSpec, flavor: str) -> str:
-        return self.resource_name(spec.container_name(flavor))
+    def container_name(self, spec: ImageSpec) -> str:
+        return self.resource_name(spec.container_name())
 
     def base_alias(self, spec: ImageSpec) -> str:
         return self.resource_name(f"{spec.image_alias}-{spec.architecture}")
 
     @property
     def containers(self) -> list[str]:
-        return [self.container_name(spec, flavor) for spec in self.specs for flavor in VARIANTS]
+        return [self.container_name(spec) for spec in self.specs]
 
     @property
     def base_aliases(self) -> list[str]:
@@ -255,13 +265,12 @@ class Pipeline:
     def launch_containers(self) -> None:
         print("[2/8] Creating and starting containers")
         for spec in self.specs:
-            for flavor in VARIANTS:
-                name = self.container_name(spec, flavor)
-                # init separates successful creation from a potentially failed start.
-                self.incus(["init", self.base_alias(spec), name])
-                self.created_containers.append(name)
-                self.incus(["start", name])
-                self.wait_for_container(name)
+            name = self.container_name(spec)
+            # init separates successful creation from a potentially failed start.
+            self.incus(["init", self.base_alias(spec), name])
+            self.created_containers.append(name)
+            self.incus(["start", name])
+            self.wait_for_container(name)
 
     def wait_for_container(self, container: str) -> None:
         deadline = time.monotonic() + self.ssh_timeout
@@ -343,15 +352,16 @@ mv "$config.vpsm" "$config"
     def setup_containers(self) -> None:
         print("[3/8] Installing and configuring SSH")
         for spec in self.specs:
-            for flavor in VARIANTS:
-                self.setup_one(spec, self.container_name(spec, flavor))
+            self.setup_one(spec, self.container_name(spec))
 
     @staticmethod
     def package_install_command(spec: ImageSpec) -> str:
         if spec.distro == "alpine":
-            return f"set -eu\napk add {COMMON_PACKAGES}"
+            return (f"set -eu\napk add {COMMON_PACKAGES}\n"
+                    "update-ca-certificates\ntest -s /etc/ssl/certs/ca-certificates.crt")
         if spec.distro in {"debian", "ubuntu"}:
-            return f"set -eu\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y {COMMON_PACKAGES}"
+            return (f"set -eu\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y {COMMON_PACKAGES}\n"
+                    "update-ca-certificates\ntest -s /etc/ssl/certs/ca-certificates.crt")
         if spec.distro in {"almalinux", "centos"}:
             major = spec.release.split("-", 1)[0].split(".", 1)[0]
             if major not in {"8", "9", "10"}:
@@ -360,13 +370,14 @@ mv "$config.vpsm" "$config"
             epel = (f"https://dl.fedoraproject.org/pub/epel/epel-release-latest-{major}.noarch.rpm"
                     if spec.distro == "centos" else "epel-release")
             return (f"set -eu\ndnf install -y dnf-plugins-core\ndnf config-manager --set-enabled {repo}\n"
-                    f"dnf install -y {epel}\ndnf install -y {COMMON_PACKAGES}")
+                    f"dnf install -y {epel}\ndnf install -y {COMMON_PACKAGES}\n"
+                    "update-ca-trust extract\ntest -s /etc/pki/tls/certs/ca-bundle.crt")
         raise ValueError("unsupported distro in package stage")
 
-    def install_all_packages(self) -> None:
-        print("[4/8] Installing all-flavor packages")
+    def install_common_packages(self) -> None:
+        print("[4/8] Installing common packages")
         for spec in self.specs:
-            self.exec_container(self.container_name(spec, "all"), self.package_install_command(spec))
+            self.exec_container(self.container_name(spec), self.package_install_command(spec))
 
     def write_readmes(self) -> None:
         print("[5/8] Writing image README files")
@@ -437,10 +448,9 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
                 package_cleanup = "apt-get clean && rm -rf /var/lib/apt/lists/*"
             else:
                 package_cleanup = "dnf clean all && rm -rf /var/cache/dnf"
-            for flavor in VARIANTS:
-                container = self.container_name(spec, flavor)
-                self.exec_container(container, common + "\n" + package_cleanup, quiet=True)
-                self.sanitized_containers.add(container)
+            container = self.container_name(spec)
+            self.exec_container(container, common + "\n" + package_cleanup, quiet=True)
+            self.sanitized_containers.add(container)
 
     def write_checksums(self) -> None:
         lines = []
@@ -458,43 +468,36 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
     def publish_and_export(self) -> None:
         print("[8/8] Publishing and exporting images")
         for spec in self.specs:
-            for flavor in VARIANTS:
-                container = self.container_name(spec, flavor)
-                if container not in self.sanitized_containers:
-                    raise RuntimeError("refusing to publish before test credentials are removed")
-                self.incus(["stop", container, "--force"])
-                self.incus(["publish", container, "--alias", container])
-                self.created_published_aliases.append(container)
-                output_name = spec.container_name(flavor)
-                # Discover each export in isolation, never by globbing the output directory.
-                with tempfile.TemporaryDirectory(prefix=".export-", dir=self.output_dir) as directory:
-                    target = Path(directory) / output_name
-                    self.incus(["image", "export", container, str(target)])
-                    files = sorted(Path(directory).iterdir())
-                    if not files or any(path.is_symlink() or not path.is_file() or path.stat().st_size == 0
-                                        or not (path.name == output_name or path.name.startswith(output_name + ".")) for path in files):
-                        raise RuntimeError(f"missing, empty or invalid export: {output_name}")
-                    # Incus explicit-target exports: unified target.tar.* OR split
-                    # target + target.root. A lone extensionless metadata file is
-                    # not a complete image. Keep the actual filenames, no guesses.
-                    suffixes = {path.name[len(output_name):] for path in files}
-                    archive_suffixes = {".tar", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst"}
-                    unified = len(suffixes) == 1 and suffixes.issubset(archive_suffixes)
-                    split = suffixes == {"", ".root"}
-                    # Also tolerate named split archives from older CLI versions.
-                    named_split = any(suffixes == {ext, ".rootfs" + root_ext}
-                                      for ext in archive_suffixes for root_ext in archive_suffixes)
-                    if not (unified or split or named_split):
-                        raise RuntimeError(f"unexpected export file set: {output_name}")
-                    for path in files:
-                        destination = self.output_dir / path.name
-                        if destination.exists() or destination.is_symlink():
-                            raise RuntimeError("refusing to overwrite an existing artifact")
-                        # Link is atomic and refuses overwrite; temp and output share a filesystem.
-                        os.link(path, destination)
-                        self.exported_files.append(path.name)
-                self.exported_files.sort()
-                self.write_checksums()
+            container = self.container_name(spec)
+            if container not in self.sanitized_containers:
+                raise RuntimeError("refusing to publish before test credentials are removed")
+            self.incus(["stop", container, "--force"])
+            self.incus(["publish", container, "--alias", container])
+            self.created_published_aliases.append(container)
+            output_name = spec.container_name()
+            # Discover each export in isolation, never by globbing the output directory.
+            with tempfile.TemporaryDirectory(prefix=".export-", dir=self.output_dir) as directory:
+                target = Path(directory) / output_name
+                self.incus(["image", "export", container, str(target)])
+                files = sorted(Path(directory).iterdir())
+                if not files or any(path.is_symlink() or not path.is_file() or path.stat().st_size == 0
+                                    or not (path.name == output_name or path.name.startswith(output_name + ".")) for path in files):
+                    raise RuntimeError(f"missing, empty or invalid export: {output_name}")
+                # Incus explicit-target exports: unified target.tar.* OR split
+                # target + target.root. A lone extensionless metadata file is
+                # not a complete image. Keep the actual filenames, no guesses.
+                suffixes = {path.name[len(output_name):] for path in files}
+                if not valid_export_suffixes(suffixes):
+                    raise RuntimeError(f"unexpected export file set: {output_name}")
+                for path in files:
+                    destination = self.output_dir / path.name
+                    if destination.exists() or destination.is_symlink():
+                        raise RuntimeError("refusing to overwrite an existing artifact")
+                    # Link is atomic and refuses overwrite; temp and output share a filesystem.
+                    os.link(path, destination)
+                    self.exported_files.append(path.name)
+            self.exported_files.sort()
+            self.write_checksums()
 
     def final_cleanup(self) -> None:
         if self.keep_resources:
@@ -521,7 +524,6 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
             "started_at": self.started_at.isoformat(),
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "architecture": self.specs[0].architecture,
-            "variants": list(VARIANTS),
             "images": [asdict(spec) | {"image_alias": self.base_alias(spec)} for spec in self.specs],
             "exported_files": [name for name in self.exported_files if (self.output_dir / name).is_file()],
         }
@@ -555,7 +557,7 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
             self.download_images()
             self.launch_containers()
             self.setup_containers()
-            self.install_all_packages()
+            self.install_common_packages()
             self.write_readmes()
             self.test_ssh()
             self.cleanup_containers()

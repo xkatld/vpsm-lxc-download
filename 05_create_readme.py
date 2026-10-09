@@ -8,7 +8,7 @@ def create_readme():
     )
     containers = [line.strip() for line in result.stdout.split("\n") if line.strip()]
 
-    content = "本系统为vpsm.link构建,本文件无实际作用可随意处理。"
+    content = "本系统为vpsm91.com构建,本文件无实际作用可随意处理。"
 
     for name in containers:
         print(f"CREATING README: {name}")
