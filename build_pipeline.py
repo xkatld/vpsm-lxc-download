@@ -12,6 +12,7 @@ import csv
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -106,16 +107,27 @@ class BuildTerminated(RuntimeError):
     pass
 
 
+class IncusCommandError(RuntimeError):
+    """Only sanitized external-command details, never argv/stdin/stdout."""
+
+
+class SetupStepError(RuntimeError):
+    """A labeled setup failure safe to print and persist."""
+
+
 class Pipeline:
     def __init__(self, specs: Sequence[ImageSpec], output_dir: Path,
                  root_password: str | None = None, keep_resources: bool = False,
-                 skip_ssh_test: bool = False, ssh_timeout: float = 120) -> None:
+                 skip_ssh_test: bool = False, ssh_timeout: float = 120,
+                 setup_diagnostics: bool = False) -> None:
         self.specs = list(specs)
         self.output_dir = output_dir
         self.root_password = root_password if root_password is not None else secrets.token_urlsafe(32)
         self.keep_resources = keep_resources
         self.skip_ssh_test = skip_ssh_test
         self.ssh_timeout = ssh_timeout
+        self.setup_diagnostics = setup_diagnostics
+        self.inherited_secrets = tuple(os.environ.get(key, "") for key in ("IMAGE_ROOT_PASSWORD", "SSHPASS"))
         self.run_id = uuid.uuid4().hex
         self.resource_prefix = f"vpsm-{self.run_id}-"
         self.created_containers: list[str] = []
@@ -157,7 +169,32 @@ class Pipeline:
             return f"external command failed (exit {exc.returncode})"
         if isinstance(exc, OSError):
             return "operating system operation failed"
-        return str(exc).replace(self.root_password, "[REDACTED]") if self.root_password else str(exc)
+        return self.redact_secrets(str(exc))
+
+    def redact_secrets(self, text: str) -> str:
+        values = {self.root_password, *self.inherited_secrets,
+                  *(os.environ.get(key, "") for key in ("IMAGE_ROOT_PASSWORD", "SSHPASS"))}
+        # Longest first handles overlapping credentials; redact before truncation.
+        for value in sorted(filter(None, values), key=len, reverse=True):
+            text = text.replace(value, "[REDACTED]")
+        return text
+
+    def safe_setup_stderr(self, stderr: str | bytes | None) -> str:
+        if not stderr:
+            return ""
+        if isinstance(stderr, bytes):  # TimeoutExpired may carry bytes even in text mode.
+            stderr = stderr.decode("utf-8", errors="replace")
+        text = self.redact_secrets(stderr)
+        # Escape terminal controls (including CR, ESC, Unicode bidi/line controls).
+        # Only LF survives; prefix EVERY line and neutralize workflow command
+        # markers too (some CI parsers search for them anywhere in the line).
+        text = "".join(c if c == "\n" or c.isprintable() else ascii(c)[1:-1] for c in text)
+        text = text.replace("::", r"\x3a\x3a").replace("##[", r"\x23\x23[")
+        lines = text.split("\n")
+        rendered = "\n".join("  setup stderr | " + line for line in lines[:12])
+        if len(rendered) > 2048 or len(lines) > 12:
+            rendered = rendered[:2048] + "\n  setup stderr | [truncated]"
+        return rendered
 
     @staticmethod
     def command_environment() -> dict[str, str]:
@@ -167,14 +204,20 @@ class Pipeline:
                 if key not in {"IMAGE_ROOT_PASSWORD", "SSHPASS"}}
 
     def incus(self, args: Sequence[str], *, capture: bool = False,
-              input: str | None = None, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+              input: str | None = None, timeout: float | None = None,
+              diagnostic_stderr: bool = False) -> subprocess.CompletedProcess[str]:
         # Always capture: neither a failing command's output nor its argv is logged.
         try:
             return subprocess.run(["incus", *args], input=input, check=True, text=True,
                                   capture_output=True, env=self.command_environment(),
                                   timeout=timeout if timeout is not None else 1800)
         except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(self.safe_error(exc)) from None
+            error = self.safe_error(exc)
+            if diagnostic_stderr and self.setup_diagnostics and input is None:
+                detail = self.safe_setup_stderr(getattr(exc, "stderr", None))
+                if detail:
+                    error += "\n" + detail
+            raise IncusCommandError(error) from None
 
     def exec_container(self, container: str, command: str, *, quiet: bool = False) -> subprocess.CompletedProcess[str]:
         if not quiet:
@@ -192,8 +235,8 @@ class Pipeline:
             raise ValueError("unsupported distro")
         if not self.root_password or any(c in self.root_password for c in "\n\r\x00"):
             raise ValueError("invalid temporary test password")
-        if self.ssh_timeout <= 0:
-            raise ValueError("SSH timeout must be positive")
+        if not math.isfinite(self.ssh_timeout) or self.ssh_timeout <= 0:
+            raise ValueError("SSH timeout must be finite and positive")
         if self.output_dir.is_symlink() or (self.output_dir.exists() and
                 (not self.output_dir.is_dir() or any(self.output_dir.iterdir()))):
             raise RuntimeError("output directory must be absent or empty")
@@ -242,18 +285,60 @@ chmod 600 "$config.vpsm"
 mv "$config.vpsm" "$config"
 """
 
+    def setup_step(self, container: str, label: str, command: str | None = None,
+                   *, timeout: float | None = None) -> None:
+        # Labels/commands are code-owned, never derived from captured output.
+        # The only credential-bearing operation has no diagnostic opt-in.
+        try:
+            if command is None:
+                self.incus(["exec", container, "--", "chpasswd"],
+                           input=f"root:{self.root_password}\n")
+            else:
+                self.incus(["exec", container, "--", "sh", "-c", command],
+                           timeout=timeout, diagnostic_stderr=True)
+        except IncusCommandError as exc:
+            raise SetupStepError(f"setup step [{label}] failed: {exc}") from None
+
+    def wait_for_package_index(self, container: str, command: str) -> None:
+        deadline = time.monotonic() + self.ssh_timeout
+        last_error = "no attempt completed"
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                self.setup_step(container, "package-index", command, timeout=min(30, remaining))
+            except SetupStepError as exc:
+                last_error = str(exc)  # Already sanitized by incus; never raw subprocess text.
+            else:
+                if time.monotonic() <= deadline:
+                    return
+                last_error = "package-index command completed after deadline"
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2, remaining))
+        raise SetupStepError(f"setup step [package-index] readiness timed out: {last_error}") from None
+
     def setup_one(self, spec: ImageSpec, container: str) -> None:
-        config = self.ssh_config_command()
+        prefix = "set -eu\n"
         if spec.distro == "alpine":
-            command = f"set -eu\napk update\napk add openssh\nssh-keygen -A\n{config}\nrc-update add sshd\nrc-service sshd restart"
+            index, install = "apk update", "apk add openssh"
+            services = [("ssh-enable", "rc-update add sshd"), ("ssh-restart", "rc-service sshd restart")]
         elif spec.distro in {"debian", "ubuntu"}:
-            command = f"set -eu\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y openssh-server\nssh-keygen -A\n{config}\n(service ssh restart || systemctl restart ssh)"
+            prefix += "export DEBIAN_FRONTEND=noninteractive\n"
+            index, install = "apt-get -o APT::Update::Error-Mode=any update", "apt-get install -y openssh-server"
+            services = [("ssh-restart", "(service ssh restart || systemctl restart ssh)")]
         elif spec.distro in {"almalinux", "centos"}:
-            command = f"set -eu\ndnf makecache\ndnf install -y openssh-server\nssh-keygen -A\n{config}\nsystemctl enable sshd\nsystemctl restart sshd"
+            index, install = "dnf makecache", "dnf install -y openssh-server"
+            services = [("ssh-enable", "systemctl enable sshd"), ("ssh-restart", "systemctl restart sshd")]
         else:
             raise ValueError("unsupported distro in setup stage")
-        self.exec_container(container, command)
-        self.incus(["exec", container, "--", "chpasswd"], input=f"root:{self.root_password}\n")
+        print(f"  container: {container}")
+        # Retry only the idempotent index refresh, not installation or SSH/password setup.
+        self.wait_for_package_index(container, prefix + index)
+        for label, command in [
+            ("ssh-install", install), ("ssh-host-keys", "ssh-keygen -A"),
+            ("ssh-config", self.ssh_config_command()), *services,
+        ]:
+            self.setup_step(container, label, prefix + command)
+        self.setup_step(container, "chpasswd")
 
     def setup_containers(self) -> None:
         print("[3/8] Installing and configuring SSH")
@@ -441,7 +526,7 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
             "exported_files": [name for name in self.exported_files if (self.output_dir / name).is_file()],
         }
         if error:
-            payload["error"] = error.replace(self.root_password, "[REDACTED]")
+            payload["error"] = self.redact_secrets(error)
         (self.output_dir / "build-summary.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_file:
@@ -478,6 +563,8 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
             status = "success"
         except (Exception, KeyboardInterrupt) as exc:
             error = self.safe_error(exc)
+            if isinstance(exc, SetupStepError):
+                print(error, file=sys.stderr)
             raise RuntimeError(error) from None
         finally:
             # A second TERM cannot interrupt best-effort bounded cleanup. Hosted VM
@@ -508,6 +595,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--keep-resources", action="store_true")
     parser.add_argument("--skip-ssh-test", action="store_true")
     parser.add_argument("--ssh-timeout", type=float, default=120)
+    parser.add_argument("--setup-diagnostics", action="store_true",
+                        help="include bounded, redacted stderr for credential-free setup failures")
     args = parser.parse_args(argv)
     if not args.matrix and not all((args.architecture, args.distro, args.release)):
         parser.error("build requires --architecture, --distro and --release")
@@ -528,7 +617,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("selection must match exactly one manifest row")
         # Never use a GitHub Secret as a published (or test) image password.
         Pipeline(specs, args.output_dir, keep_resources=args.keep_resources,
-                 skip_ssh_test=args.skip_ssh_test, ssh_timeout=args.ssh_timeout).run()
+                 skip_ssh_test=args.skip_ssh_test, ssh_timeout=args.ssh_timeout,
+                 setup_diagnostics=args.setup_diagnostics).run()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         # Detailed sanitized errors are in build-summary.json when a build started.
         print("Build failed; see build-summary.json if created (no credentials logged).", file=sys.stderr)

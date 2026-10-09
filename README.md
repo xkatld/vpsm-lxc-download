@@ -131,6 +131,14 @@ Error: Remote images exists as <https://images.linuxcontainers.org>
 
 修复需要提交并推送后，通过新的 push 或手动触发构建来验证。不要只点旧运行的 **Re-run jobs**：它仍使用旧提交，不会包含修复。
 
+### 容器启动后的软件源就绪
+
+容器能够执行 `true` 不代表 DHCP、DNS 和软件源已就绪。流水线在安装 SSH 之前，以包管理器刷新索引作为就绪探测：Alpine 使用 `apk update`、Debian/Ubuntu 使用严格报错的 `apt-get update`、AlmaLinux/CentOS 使用 `dnf makecache`。探测有总截止时间和单次超时；超时仍失败，不跳过安装或 SSH 测试，也不无限重试。
+
+SSH 安装配置拆分为具名步骤。工作流启用 `--setup-diagnostics`，仅对明确不含凭据的步骤保留限长、脱敏的 stderr；密码设置和 SSH 登录测试仍隐藏输出。本地可按需添加此选项，默认不披露子进程输出。失败步骤及安全错误信息会进入日志和 `build-summary.json`，便于区别网络未就绪、包安装失败和服务启动失败。
+
+本地复现及对照实验见 [Incus 实测记录](docs/local-incus-reproduction-2026-10-09.md)。本地 x86_64 验证不等于远程 ARM64 构建成功，以对应 Actions 运行结果为准。
+
 ### 资源与诊断
 
 - `fail-fast: false`：一个版本失败不会取消其他版本；最终汇总仍标记失败，不能假装全量成功。

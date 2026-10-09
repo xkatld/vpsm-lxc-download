@@ -400,6 +400,238 @@ class SafeCommandTests(HermeticTestCase):
         self.assertEqual(execute.call_args.args[0], pipeline.container_name(self.spec, "all"))
 
 
+class SetupReadinessTests(HermeticTestCase):
+    def test_every_release_recovers_index_before_installing_each_variant(self):
+        self.fake_clock()
+        for architecture in RUNNERS:
+            for distro, release in RELEASES:
+                with self.subTest(architecture=architecture, distro=distro, release=release):
+                    spec = spec_for(distro, release, architecture)
+                    pipeline = self.pipeline(specs=[spec])
+                    attempts = {}
+                    calls = []
+                    index = ("apk update" if distro == "alpine" else
+                             "apt-get -o APT::Update::Error-Mode=any update" if distro in {"debian", "ubuntu"} else
+                             "dnf makecache")
+
+                    def invoke(args, **kwargs):
+                        calls.append((args, kwargs))
+                        container, command = args[2], args[-1]
+                        if command.endswith(index):
+                            attempts[container] = attempts.get(container, 0) + 1
+                            self.assertGreater(kwargs["timeout"], 0)
+                            self.assertLessEqual(kwargs["timeout"], 30)
+                            if attempts[container] == 1:
+                                raise subprocess.CalledProcessError(1, args, stderr="temporary DNS failure")
+                        else:
+                            self.assertEqual(attempts[container], 2)
+                        return completed()
+
+                    self.subprocess.side_effect = invoke
+                    pipeline.setup_containers()
+                    self.assertEqual(attempts, {container: 2 for container in pipeline.containers})
+                    for container in pipeline.containers:
+                        commands = [args[-1] for args, _ in calls if args[2] == container]
+                        self.assertEqual(commands[-1], "chpasswd")
+                        self.assertEqual(sum("ssh-keygen -A" in command for command in commands), 1)
+                        self.assertEqual(sum("sshd_config" in command for command in commands), 1)
+                        self.assertEqual(sum("openssh" in command for command in commands), 1)
+                        if distro in {"debian", "ubuntu"}:
+                            self.assertTrue(all("export DEBIAN_FRONTEND=noninteractive" in command for command in commands[:-1]))
+                            self.assertIn("(service ssh restart || systemctl restart ssh)", commands[-2])
+                        else:
+                            enable = "rc-update add sshd" if distro == "alpine" else "systemctl enable sshd"
+                            restart = "rc-service sshd restart" if distro == "alpine" else "systemctl restart sshd"
+                            self.assertTrue(commands[-3].endswith(enable))
+                            self.assertTrue(commands[-2].endswith(restart))
+
+    def test_index_failure_stops_at_deadline_without_install_or_password(self):
+        now, sleep = self.fake_clock()
+        pipeline = self.pipeline(ssh_timeout=5)
+        self.subprocess.side_effect = subprocess.CalledProcessError(1, ["private argv"], stderr="DNS unavailable")
+        with self.assertRaisesRegex(build_pipeline.SetupStepError, r"\[package-index\] readiness timed out"):
+            pipeline.setup_one(self.spec, "owned")
+        self.assertEqual(now[0], 5)
+        self.assertEqual([item.kwargs["timeout"] for item in self.subprocess.call_args_list], [5, 3, 1])
+        self.assertEqual([item.args[0] for item in sleep.call_args_list], [2, 2, 1])
+        self.assertTrue(all(item.args[0][-1].endswith(" update") for item in self.subprocess.call_args_list))
+
+    def test_per_call_timeout_and_total_deadline_include_command_runtime(self):
+        now, sleep = self.fake_clock()
+        pipeline = self.pipeline(ssh_timeout=35, setup_diagnostics=True)
+
+        def timeout(args, **kwargs):
+            now[0] += kwargs["timeout"]
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"], stderr=b"DNS still unavailable")
+
+        self.subprocess.side_effect = timeout
+        with self.assertRaises(build_pipeline.SetupStepError) as raised:
+            pipeline.setup_one(self.spec, "owned")
+        self.assertEqual(now[0], 35)
+        self.assertEqual([item.kwargs["timeout"] for item in self.subprocess.call_args_list], [30, 3])
+        sleep.assert_called_once_with(2)
+        self.assertIn("DNS still unavailable", str(raised.exception))
+        self.assertIn("external command timed out", str(raised.exception))
+
+    def test_index_timeout_can_recover(self):
+        self.fake_clock()
+        pipeline = self.pipeline(ssh_timeout=5)
+        self.subprocess.side_effect = [subprocess.TimeoutExpired(["private"], 1), completed()]
+        pipeline.wait_for_package_index("owned", "apk update")
+        self.assertEqual(self.subprocess.call_count, 2)
+
+    def test_success_after_deadline_is_not_accepted(self):
+        now, sleep = self.fake_clock()
+        pipeline = self.pipeline(ssh_timeout=5)
+
+        def late_success(*args, **kwargs):
+            now[0] = 6
+            return completed()
+
+        self.subprocess.side_effect = late_success
+        with self.assertRaisesRegex(build_pipeline.SetupStepError, "readiness timed out"):
+            pipeline.wait_for_package_index("owned", "apk update")
+        self.subprocess.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_interrupts_are_not_retried(self):
+        _, sleep = self.fake_clock()
+        for error in (build_pipeline.BuildTerminated("terminated"), KeyboardInterrupt()):
+            self.subprocess.reset_mock()
+            self.subprocess.side_effect = error
+            with self.assertRaises(type(error)):
+                self.pipeline().setup_one(self.spec, "owned")
+            self.subprocess.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_non_index_steps_fail_once_with_labels(self):
+        _, sleep = self.fake_clock()
+        steps = [
+            ("ssh-install", "apk add openssh"), ("ssh-host-keys", "ssh-keygen -A"),
+            ("ssh-config", "sshd_config"), ("ssh-enable", "rc-update add sshd"),
+            ("ssh-restart", "rc-service sshd restart"), ("chpasswd", "chpasswd"),
+        ]
+        for label, marker in steps:
+            with self.subTest(label=label):
+                self.subprocess.reset_mock()
+
+                def fail_step(args, **kwargs):
+                    if marker in args[-1]:
+                        raise subprocess.CalledProcessError(7, args, stderr="setup failed")
+                    return completed()
+
+                self.subprocess.side_effect = fail_step
+                with self.assertRaises(build_pipeline.SetupStepError) as raised:
+                    self.pipeline().setup_one(spec_for("alpine", "3.21"), "owned")
+                self.assertIn(f"[{label}]", str(raised.exception))
+                self.assertIn("exit 7", str(raised.exception))
+                self.assertEqual(sum(marker in item.args[0][-1] for item in self.subprocess.call_args_list), 1)
+                self.assertIn(marker, self.subprocess.call_args.args[0][-1])
+        sleep.assert_not_called()
+
+    def test_nonfinite_or_nonpositive_timeout_rejected(self):
+        self.native_tools()
+        for timeout in (0, -1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                self.pipeline(ssh_timeout=timeout).preflight()
+        self.subprocess.assert_not_called()
+
+
+class SetupDiagnosticTests(HermeticTestCase):
+    def test_diagnostics_require_explicit_cli_opt_in(self):
+        args = ["--architecture", "arm64", "--distro", "alpine", "--release", "3.21"]
+        self.assertFalse(build_pipeline.parse_args(args).setup_diagnostics)
+        self.assertTrue(build_pipeline.parse_args([*args, "--setup-diagnostics"]).setup_diagnostics)
+        for enabled in (False, True):
+            with patch.object(build_pipeline.Pipeline, "run", autospec=True) as run:
+                status = build_pipeline.main(["--manifest", str(self.manifest), *args,
+                                             *(["--setup-diagnostics"] if enabled else [])])
+                self.assertEqual(status, 0)
+                self.assertEqual(run.call_args.args[0].setup_diagnostics, enabled)
+
+    def test_default_setup_diagnostics_remain_opaque(self):
+        self.subprocess.side_effect = subprocess.CalledProcessError(2, ["ARGV"], output="STDOUT", stderr="STDERR")
+        with self.assertRaises(build_pipeline.SetupStepError) as raised:
+            self.pipeline().setup_step("owned", "ssh-install", "apk add openssh")
+        self.assertEqual(str(raised.exception), "setup step [ssh-install] failed: external command failed (exit 2)")
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_diagnostics_redact_all_credentials_escape_controls_and_prefix_lines(self):
+        with patch.dict(os.environ, {"IMAGE_ROOT_PASSWORD": "inherited-image-secret", "SSHPASS": "inherited-ssh-secret"}):
+            pipeline = self.pipeline(setup_diagnostics=True)
+        raw = (f"DNS unavailable {self.password} inherited-image-secret inherited-ssh-secret\n"
+               "::error::injected\r\x1b[2J\x00\x08\x85" + chr(0x2028) + chr(0x202E) + "\n##[error]injected")
+        for error in (subprocess.CalledProcessError(1, ["PRIVATE_ARGV"], output="PRIVATE_STDOUT", stderr=raw),
+                      subprocess.TimeoutExpired(["PRIVATE_ARGV"], 2, output=b"PRIVATE_STDOUT", stderr=raw.encode())):
+            self.subprocess.side_effect = error
+            with self.assertRaises(build_pipeline.SetupStepError) as raised:
+                pipeline.setup_step("owned", "ssh-install", "PRIVATE_COMMAND")
+            message = str(raised.exception)
+            for private in (self.password, "inherited-image-secret", "inherited-ssh-secret", "PRIVATE_ARGV", "PRIVATE_STDOUT", "PRIVATE_COMMAND"):
+                self.assertNotIn(private, message)
+            self.assertIn("DNS unavailable", message)
+            self.assertIn("[REDACTED]", message)
+            self.assertNotIn("::", message)
+            self.assertNotIn("##[", message)
+            self.assertTrue(all(line.startswith("  setup stderr | ") for line in message.splitlines()[1:]))
+            self.assertTrue(all(c == "\n" or c.isprintable() for c in message))
+            for escaped in (r"\r", r"\x1b", r"\x00", r"\x08", r"\x85", ascii(chr(0x2028))[1:-1], ascii(chr(0x202E))[1:-1]):
+                self.assertIn(escaped, message)
+            self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_redaction_happens_before_clipping_and_output_is_bounded(self):
+        pipeline = self.pipeline(setup_diagnostics=True, root_password="UNIQUE-PASSWORD-CROSSING-CLIP")
+        text = pipeline.safe_setup_stderr("x" * 2020 + pipeline.root_password + "z" * 10000)
+        self.assertNotIn("UNIQUE", text)
+        self.assertIn("[truncated]", text)
+        self.assertLess(len(text), 2100)
+        text = pipeline.safe_setup_stderr("::error::injected\n" * 10000)
+        self.assertLessEqual(len(text.splitlines()), 13)
+        self.assertTrue(all(line.startswith("  setup stderr | ") for line in text.splitlines()))
+
+    def test_chpasswd_remains_private_even_with_diagnostics_enabled(self):
+        pipeline = self.pipeline(setup_diagnostics=True)
+        self.subprocess.side_effect = subprocess.CalledProcessError(1, ["ARGV"], output="STDOUT", stderr="PRIVATE_PASSWORD_OUTPUT")
+        with self.assertRaises(build_pipeline.SetupStepError) as raised:
+            pipeline.setup_step("owned", "chpasswd")
+        self.assertEqual(str(raised.exception), "setup step [chpasswd] failed: external command failed (exit 1)")
+        self.assertEqual(self.subprocess.call_args.kwargs["input"], f"root:{self.password}\n")
+        # Defense in depth: stdin-bearing calls cannot opt in accidentally either.
+        with self.assertRaises(build_pipeline.IncusCommandError) as raised:
+            pipeline.incus(["exec", "owned", "--", "chpasswd"], input="private", diagnostic_stderr=True)
+        self.assertNotIn("PRIVATE_PASSWORD_OUTPUT", str(raised.exception))
+
+    def test_other_incus_calls_remain_opaque_with_setup_diagnostics_enabled(self):
+        pipeline = self.pipeline(setup_diagnostics=True)
+        self.subprocess.side_effect = subprocess.CalledProcessError(1, ["ARGV"], output="STDOUT", stderr="PRIVATE_STDERR")
+        for action in (lambda: pipeline.incus(["version"]),
+                       lambda: pipeline.install_all_packages(), lambda: pipeline.cleanup_containers()):
+            with self.assertRaises(build_pipeline.IncusCommandError) as raised:
+                action()
+            self.assertEqual(str(raised.exception), "external command failed (exit 1)")
+
+    def test_safe_setup_error_printed_and_persisted_without_raw_main_errors(self):
+        pipeline = self.pipeline(setup_diagnostics=True)
+        self.subprocess.side_effect = subprocess.CalledProcessError(9, ["PRIVATE_ARGV"], output="PRIVATE_STDOUT", stderr=f"DNS unavailable {self.password}\n::error::injected")
+        log = io.StringIO()
+        with patch.object(pipeline, "preflight"), patch.object(pipeline, "download_images"), patch.object(pipeline, "launch_containers"), patch.object(pipeline, "setup_containers", side_effect=lambda: pipeline.setup_step("owned", "ssh-install", "apk add openssh")), patch.object(pipeline, "final_cleanup"), contextlib.redirect_stderr(log):
+            with self.assertRaises(RuntimeError) as raised:
+                pipeline.run()
+        summary = json.loads((self.output / "build-summary.json").read_text())
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["error"], str(raised.exception))
+        self.assertIn(summary["error"], log.getvalue())
+        self.assertIn("DNS unavailable", log.getvalue())
+        self.assertIn("[ssh-install]", log.getvalue())
+        for private in (self.password, "PRIVATE_ARGV", "PRIVATE_STDOUT"):
+            self.assertNotIn(private, log.getvalue() + json.dumps(summary))
+        self.assertTrue(raised.exception.__suppress_context__)
+        with patch.object(build_pipeline.Pipeline, "run", side_effect=RuntimeError("UNSAFE_MAIN_ERROR")), contextlib.redirect_stderr(log):
+            status = build_pipeline.main(["--manifest", str(self.manifest), "--architecture", "arm64", "--distro", "debian", "--release", "bookworm", "--setup-diagnostics"])
+        self.assertEqual(status, 1)
+        self.assertNotIn("UNSAFE_MAIN_ERROR", log.getvalue())
+
+
 class OwnershipTests(HermeticTestCase):
     def test_failed_copy_does_not_record_alias(self):
         pipeline = self.pipeline()

@@ -75,7 +75,7 @@ jobs:
           sudo --preserve-env=GITHUB_STEP_SUMMARY,PYTHONUNBUFFERED \
             python3 build_pipeline.py --manifest '镜像.md' \
               --architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO" \
-              --release "$TARGET_RELEASE" --output-dir dist
+              --release "$TARGET_RELEASE" --output-dir dist --setup-diagnostics
       - name: Make export files readable for artifact upload
         run: |
           sudo chown -R "$(id -u):$(id -g)" dist
@@ -96,6 +96,11 @@ jobs:
           df -h > diagnostics/disk.txt
           sudo journalctl -u incus --no-pager -n 200 > diagnostics/incus.log 2>&1 || true
           sudo incus list --format json > diagnostics/instances.json 2>&1 || true
+          ip -4 address show > diagnostics/host-addresses.txt 2>&1 || true
+          ip -4 route show table all > diagnostics/host-routes.txt 2>&1 || true
+          sudo iptables -S FORWARD > diagnostics/forward-rules.txt 2>&1 || true
+          sudo iptables -S DOCKER-USER > diagnostics/docker-user-rules.txt 2>&1 || true
+          sudo incus network show incusbr0 > diagnostics/incus-network.txt 2>&1 || true
           if sudo test -f dist/build-summary.json; then
             sudo cp dist/build-summary.json diagnostics/
           fi
