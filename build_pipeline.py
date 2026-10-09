@@ -430,14 +430,96 @@ mv "$config.vpsm" "$config"
                 raise RuntimeError(f"SSH readiness/authentication timed out: {container}")
             print(f"  {container}: OK")
 
+    @staticmethod
+    def first_boot_identity_command(spec: ImageSpec) -> str:
+        # Install, but do not start: the build's SSH test still uses its original
+        # keys. ssh-keygen -A creates only missing keys, including on later boots.
+        if spec.distro == "alpine":
+            return """set -eu
+cat > /etc/init.d/vpsm-firstboot <<'EOF'
+#!/sbin/openrc-run
+description="Initialize missing container identities"
+depend() {
+    need localmount
+    before networking sshd dbus machine-id
+}
+start() {
+    (
+        set -eu
+        if ! test -s /etc/machine-id; then
+            umask 022
+            tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id
+            test -s /etc/machine-id
+            chmod 0644 /etc/machine-id
+        fi
+        /usr/bin/ssh-keygen -A
+    )
+}
+EOF
+chmod 0755 /etc/init.d/vpsm-firstboot
+rc-update add vpsm-firstboot boot
+# Also require the initializer for manual starts, not only runlevel ordering.
+for service in networking sshd; do
+    printf '\\nrc_need="${rc_need:-} vpsm-firstboot"\\n' >> "/etc/conf.d/$service"
+done
+"""
+        return """set -eu
+cat > /etc/systemd/system/vpsm-firstboot.service <<'EOF'
+[Unit]
+Description=Initialize missing SSH host keys
+# Socket units precede basic.target. Default service dependencies would cycle.
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service sshd.service ssh.socket sshd.socket shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# Include the EL native key generator so two keygens cannot race at boot.
+for unit in ssh.service sshd.service ssh.socket sshd.socket sshd-keygen@.service; do
+    mkdir -p "/etc/systemd/system/$unit.d"
+    cat > "/etc/systemd/system/$unit.d/10-vpsm-firstboot.conf" <<'EOF'
+[Unit]
+Requires=vpsm-firstboot.service
+After=vpsm-firstboot.service
+EOF
+done
+systemctl daemon-reload
+systemctl enable vpsm-firstboot.service
+"""
+
     def cleanup_containers(self) -> None:
         print("[7/8] Removing test credentials and caches; locking root")
         common = """set -eu
 printf 'root:!\\n' | chpasswd -e
-# Remove password backups as well as login/test state; do not leave a locked hash.
-rm -f /etc/shadow- /etc/shadow~ /etc/shadow.bak /var/backups/shadow*
-rm -rf /root/.ssh /tmp/* /var/tmp/*
-rm -f /root/.bash_history /root/.ash_history /root/.zsh_history
+# Remove account backups as well as login/test state; never remove live databases.
+for path in /etc/shadow- /etc/shadow~ /etc/shadow.bak \\
+            /etc/gshadow- /etc/gshadow~ /etc/gshadow.bak \\
+            /etc/passwd- /etc/passwd~ /etc/passwd.bak \\
+            /etc/group- /etc/group~ /etc/group.bak \\
+            /var/backups/shadow* /var/backups/gshadow* \\
+            /var/backups/passwd* /var/backups/group* \\
+            /root/.ssh /root/.bash_history /root/.ash_history /root/.zsh_history; do
+    rm -rf -- "$path"
+    test ! -e "$path" && test ! -L "$path"
+done
+# Include dotfiles without globbing . or ..; keep the temporary directories themselves.
+# Do not follow a symlink masquerading as a temporary directory.
+for directory in /tmp /var/tmp; do
+    test ! -L "$directory"
+    if test -d "$directory"; then
+        for path in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+            rm -rf -- "$path"
+            test ! -e "$path" && test ! -L "$path"
+        done
+    fi
+done
 # Verify the published shadow entry is exactly a non-password lock marker.
 awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 1 }' /etc/shadow
 """
@@ -449,7 +531,37 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
             else:
                 package_cleanup = "dnf clean all && rm -rf /var/cache/dnf"
             container = self.container_name(spec)
-            self.exec_container(container, common + "\n" + package_cleanup, quiet=True)
+            # Stop listeners first so socket activation cannot regenerate keys
+            # between their removal and the force-stop. Keep boot enablement.
+            stop_ssh = ("rc-service sshd stop\n" if spec.distro == "alpine" else """
+for unit in ssh.socket sshd.socket ssh.service sshd.service; do
+    if load_state=$(systemctl show "$unit" --property=LoadState --value); then
+        test -n "$load_state"
+    else
+        # Some systemd versions return nonzero for an explicitly missing unit.
+        # Only that exact state is ignorable; other query errors must abort.
+        test "$load_state" = not-found
+    fi
+    if test "$load_state" != not-found; then
+        systemctl stop "$unit"
+    fi
+done
+""")
+            # No guest commands may restart SSH after this final cleanup. The
+            # next stage force-stops the guest, then resets its on-disk machine ID.
+            identity_cleanup = """
+# Remove private AND public build host keys only after the SSH login test.
+for path in /etc/ssh/ssh_host_*; do
+    rm -f -- "$path"
+    test ! -e "$path" && test ! -L "$path"
+done
+# PID 1 must not reuse the build identity through D-Bus on the next boot.
+mkdir -p /var/lib/dbus
+rm -f /var/lib/dbus/machine-id
+ln -s /etc/machine-id /var/lib/dbus/machine-id
+"""
+            self.exec_container(container, common + "\n" + package_cleanup + "\n"
+                                + self.first_boot_identity_command(spec) + stop_ssh + identity_cleanup, quiet=True)
             self.sanitized_containers.add(container)
 
     def write_checksums(self) -> None:
@@ -472,6 +584,11 @@ awk -F: '$1 == "root" { found=1; if ($2 != "!") exit 1 } END { if (!found) exit 
             if container not in self.sanitized_containers:
                 raise RuntimeError("refusing to publish before test credentials are removed")
             self.incus(["stop", container, "--force"])
+            # Reset the backing file with the guest STOPPED: PID 1 may otherwise
+            # commit its runtime machine-id after a live truncate. Incus mounts
+            # stopped-container storage and maps these guest-root IDs itself.
+            self.incus(["file", "push", "-", f"{container}/etc/machine-id",
+                        "--uid=0", "--gid=0", "--mode=0644"], input="")
             self.incus(["publish", container, "--alias", container])
             self.created_published_aliases.append(container)
             output_name = spec.container_name()

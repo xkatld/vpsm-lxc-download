@@ -17,6 +17,22 @@ class RepositoryConfigTests(unittest.TestCase):
         self.assertIn("matrix.runner", text)
         self.assertIn("verify_artifacts.py", text)
 
+    def test_native_acceptance_gates_image_upload(self):
+        text = (ROOT / ".github/workflows/build-images.yml").read_text()
+        build = text.index("python3 build_pipeline.py --manifest", text.index("  build:"))
+        ipv6 = text.index("incus network set incusbr0 ipv6.address auto")
+        acceptance = text.index("python3 -I scripts/accept_image.py")
+        upload = text.index("- name: Upload verified image files")
+        self.assertLess(build, ipv6)
+        self.assertLess(ipv6, acceptance)
+        self.assertLess(acceptance, upload)
+        self.assertIn('--architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO"', text)
+        self.assertIn('--release "$TARGET_RELEASE" --report-dir acceptance', text)
+        self.assertIn("name: acceptance-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}", text)
+        self.assertIn("steps.acceptance.outcome != 'skipped'", text)
+        self.assertIn("path: acceptance/", text)
+        self.assertNotIn("continue-on-error", text)
+
     def test_manifest_has_matching_versions_for_both_architectures(self):
         with (ROOT / "镜像.md").open() as handle:
             rows = list(csv.reader(handle, delimiter="\t"))[1:]

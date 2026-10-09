@@ -76,6 +76,35 @@ jobs:
             python3 build_pipeline.py --manifest '镜像.md' \
               --architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO" \
               --release "$TARGET_RELEASE" --output-dir dist --setup-diagnostics
+      # Keep package downloads on the existing IPv4 build network. Enable a
+      # private IPv6 subnet only for post-export acceptance; no public IPv6 needed.
+      - name: Enable internal IPv6 for acceptance
+        run: |
+          sudo incus network set incusbr0 ipv6.nat true
+          sudo incus network set incusbr0 ipv6.address auto
+      - name: Reimport and accept image over IPv4 and IPv6
+        id: acceptance
+        timeout-minutes: 20
+        run: |
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,PYTHONUNBUFFERED \
+            python3 -I scripts/accept_image.py --output-dir dist \
+              --architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO" \
+              --release "$TARGET_RELEASE" --report-dir acceptance
+      - name: Make acceptance report readable
+        if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
+        run: |
+          if sudo test -d acceptance; then
+            sudo chown -R "$(id -u):$(id -g)" acceptance
+            chmod -R u+rwX acceptance
+          fi
+      - name: Upload acceptance report
+        if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
+          path: acceptance/
+          if-no-files-found: error
+          retention-days: 7
       - name: Make export files readable for artifact upload
         run: |
           sudo chown -R "$(id -u):$(id -g)" dist
@@ -98,6 +127,8 @@ jobs:
           sudo incus list --format json > diagnostics/instances.json 2>&1 || true
           ip -4 address show > diagnostics/host-addresses.txt 2>&1 || true
           ip -4 route show table all > diagnostics/host-routes.txt 2>&1 || true
+          ip -6 address show > diagnostics/host-ipv6-addresses.txt 2>&1 || true
+          ip -6 route show table all > diagnostics/host-ipv6-routes.txt 2>&1 || true
           sudo iptables -S FORWARD > diagnostics/forward-rules.txt 2>&1 || true
           sudo iptables -S DOCKER-USER > diagnostics/docker-user-rules.txt 2>&1 || true
           sudo incus network show incusbr0 > diagnostics/incus-network.txt 2>&1 || true

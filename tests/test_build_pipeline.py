@@ -839,6 +839,70 @@ class ReadinessAndSshTests(HermeticTestCase):
         self.subprocess.assert_not_called()
 
 
+class CloneIdentityTests(HermeticTestCase):
+    def test_systemd_generator_precedes_services_and_sockets_without_cycle(self):
+        for distro, release in RELEASES:
+            if distro == "alpine":
+                continue
+            with self.subTest(distro=distro, release=release):
+                command = build_pipeline.Pipeline.first_boot_identity_command(spec_for(distro, release))
+                self.assertIn("DefaultDependencies=no", command)
+                self.assertIn("After=local-fs.target", command)
+                self.assertIn("Before=ssh.service sshd.service ssh.socket sshd.socket shutdown.target", command)
+                self.assertIn("Conflicts=shutdown.target", command)
+                self.assertIn("Type=oneshot", command)
+                self.assertIn("ExecStart=/usr/bin/ssh-keygen -A", command)
+                self.assertIn("RemainAfterExit=yes", command)
+                self.assertIn("for unit in ssh.service sshd.service ssh.socket sshd.socket sshd-keygen@.service; do", command)
+                self.assertIn("Requires=vpsm-firstboot.service\nAfter=vpsm-firstboot.service", command)
+                self.assertIn("systemctl daemon-reload\nsystemctl enable vpsm-firstboot.service", command)
+                # Blank machine-id is initialized by PID 1, not a late boot service.
+                self.assertNotIn("machine-id-setup", command)
+                self.assertNotIn("ConditionFirstBoot", command)
+                self.assertNotIn("ConditionVirtualization", command)
+                self.assertNotIn("systemd-firstboot", command)
+                self.assertNotIn("--now", command)
+                self.assertNotIn("rm ", command)
+                self.assertNotIn("ssh-keygen -t", command)
+
+    def test_alpine_initializes_only_missing_identities_before_network(self):
+        for distro, release in RELEASES:
+            if distro != "alpine":
+                continue
+            with self.subTest(release=release):
+                command = build_pipeline.Pipeline.first_boot_identity_command(spec_for(distro, release))
+                self.assertIn("#!/sbin/openrc-run", command)
+                self.assertIn("need localmount", command)
+                self.assertIn("before networking sshd dbus machine-id", command)
+                self.assertIn("if ! test -s /etc/machine-id; then", command)
+                self.assertIn("tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id", command)
+                self.assertIn("chmod 0644 /etc/machine-id", command)
+                self.assertIn("fi\n        /usr/bin/ssh-keygen -A", command)
+                self.assertIn("chmod 0755 /etc/init.d/vpsm-firstboot", command)
+                self.assertIn("rc-update add vpsm-firstboot boot", command)
+                self.assertIn("for service in networking sshd; do", command)
+                self.assertIn('rc_need="${rc_need:-} vpsm-firstboot"', command)
+                self.assertNotIn("systemctl", command)
+                self.assertNotIn("rm ", command)
+                self.assertNotIn("ssh-keygen -t", command)
+                self.assertNotIn("rc-service", command)
+
+    def test_build_setup_keeps_host_keys_until_after_ssh_test(self):
+        for distro, release in RELEASES:
+            with self.subTest(distro=distro, release=release):
+                spec = spec_for(distro, release)
+                pipeline = self.pipeline(specs=[spec])
+                with patch.object(pipeline, "incus", return_value=completed()) as incus:
+                    pipeline.setup_one(spec, pipeline.container_name(spec))
+                commands = [item.args[0][-1] for item in incus.call_args_list]
+                self.assertIn("set -eu\nssh-keygen -A", "\n".join(commands).replace("export DEBIAN_FRONTEND=noninteractive\n", ""))
+                self.assertFalse(any("ssh_host_*" in command for command in commands))
+                self.assertFalse(any("vpsm-firstboot" in command for command in commands))
+        stages = RunLifecycleTests.STAGES
+        self.assertLess(stages.index("test_ssh"), stages.index("cleanup_containers"))
+        self.assertLess(stages.index("cleanup_containers"), stages.index("publish_and_export"))
+
+
 class SanitizationAndExportTests(HermeticTestCase):
     def prepared_pipeline(self, **kwargs):
         pipeline = self.pipeline(**kwargs)
@@ -897,9 +961,88 @@ class SanitizationAndExportTests(HermeticTestCase):
                     command = item.args[1]
                     self.assertIn("root:!", command)
                     self.assertIn("chpasswd -e", command)
-                    self.assertIn("/etc/shadow-", command)
+                    for database in ("shadow", "gshadow", "passwd", "group"):
+                        for suffix in ("-", "~", ".bak"):
+                            self.assertIn(f"/etc/{database}{suffix}", command)
+                        self.assertIn(f"/var/backups/{database}*", command)
+                    self.assertIn('test ! -e "$path" && test ! -L "$path"', command)
+                    self.assertIn('"$directory"/.[!.]*', command)
+                    self.assertIn('"$directory"/..?*', command)
+                    self.assertIn('test ! -L "$directory"', command)
+                    self.assertNotIn('"$directory"/.*', command)
                     self.assertIn("/root/.ssh", command)
+                    self.assertIn(pipeline.first_boot_identity_command(spec_for(distro, release)), command)
+                    self.assertIn('for path in /etc/ssh/ssh_host_*; do\n    rm -f -- "$path"', command)
+                    self.assertIn("rm -f /var/lib/dbus/machine-id\nln -s /etc/machine-id /var/lib/dbus/machine-id", command)
+                    self.assertLess(command.index("ssh-keygen -A"), command.index("for path in /etc/ssh/ssh_host_*"))
+                    if distro == "alpine":
+                        self.assertLess(command.index("rc-service sshd stop"), command.index("for path in /etc/ssh/ssh_host_*"))
+                    else:
+                        self.assertIn("for unit in ssh.socket sshd.socket ssh.service sshd.service; do", command)
+                        self.assertIn('load_state=$(systemctl show "$unit" --property=LoadState --value)', command)
+                        self.assertIn('if test "$load_state" != not-found; then\n        systemctl stop "$unit"', command)
+                        self.assertLess(command.index('systemctl stop "$unit"'), command.index("for path in /etc/ssh/ssh_host_*"))
+                    self.assertNotIn("|| true", command)
+                    self.assertNotIn("systemctl disable", command)
                     self.assertNotIn(self.password, command)
+
+    def test_identity_is_reset_on_stopped_rootfs_before_publish_for_every_release(self):
+        for distro, release in RELEASES:
+            with self.subTest(distro=distro, release=release):
+                self.output = self.root / f"{distro}-{release}"
+                pipeline = self.prepared_pipeline(specs=[spec_for(distro, release)])
+                pipeline.sanitized_containers.clear()
+                container = pipeline.containers[0]
+                state = {"running": True, "machine_id": "a" * 32, "keys": True}
+                callback, _ = self.export_callback()
+                calls = []
+
+                def invoke(args, **kwargs):
+                    calls.append((args, kwargs))
+                    if args[0] == "exec":
+                        self.assertTrue(state["running"])
+                        self.assertIn("for path in /etc/ssh/ssh_host_*", args[-1])
+                        self.assertIn("ln -s /etc/machine-id /var/lib/dbus/machine-id", args[-1])
+                        state["keys"] = False
+                    elif args[0] == "stop":
+                        self.assertEqual(args, ["stop", container, "--force"])
+                        self.assertFalse(state["keys"])
+                        state["running"] = False
+                        # Simulate any last runtime commit; a live-only reset fails.
+                        state["machine_id"] = "b" * 32
+                    elif args[:2] == ["file", "push"]:
+                        self.assertFalse(state["running"])
+                        self.assertEqual(args, ["file", "push", "-", f"{container}/etc/machine-id",
+                                                "--uid=0", "--gid=0", "--mode=0644"])
+                        self.assertEqual(kwargs["input"], "")
+                        state["machine_id"] = kwargs["input"]
+                    elif args[0] == "publish":
+                        self.assertEqual(state, {"running": False, "machine_id": "", "keys": False})
+                    return callback(args, **kwargs)
+
+                with patch.object(pipeline, "incus", side_effect=invoke):
+                    pipeline.cleanup_containers()
+                    pipeline.publish_and_export()
+                self.assertEqual([args[0] for args, _ in calls], ["exec", "stop", "file", "publish", "image"])
+
+    def test_failed_stop_or_machine_id_reset_prevents_publish(self):
+        for failed_action in ("stop", "file"):
+            with self.subTest(failed_action=failed_action):
+                pipeline = self.prepared_pipeline()
+
+                def invoke(args, **kwargs):
+                    if args[0] == failed_action:
+                        raise RuntimeError("identity sanitization interrupted")
+                    return completed()
+
+                with patch.object(pipeline, "incus", side_effect=invoke) as incus:
+                    with self.assertRaises(RuntimeError):
+                        pipeline.publish_and_export()
+                actions = [item.args[0][0] for item in incus.call_args_list]
+                self.assertNotIn("publish", actions)
+                self.assertNotIn("image", actions)
+                self.assertEqual(pipeline.created_published_aliases, [])
+                self.assertEqual(pipeline.exported_files, [])
 
     def test_failed_sanitization_does_not_mark_container_safe(self):
         pipeline = self.pipeline()
