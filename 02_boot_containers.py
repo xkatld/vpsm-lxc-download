@@ -10,14 +10,18 @@ def boot_containers():
     
     version_map = {
         "debian": {
-            "bullseye": "11",
             "bookworm": "12",
+            "forky": "14",
             "trixie": "13"
         },
         "ubuntu": {
             "jammy": "2204",
             "noble": "2404",
             "resolute": "2604"
+        },
+        "centos": {
+            "9-Stream": "9-stream",
+            "10-Stream": "10-stream"
         }
     }
     

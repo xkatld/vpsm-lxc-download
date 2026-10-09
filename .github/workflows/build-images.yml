@@ -1,0 +1,136 @@
+name: Build Incus images
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.py'
+      - '镜像.md'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  schedule:
+    - cron: '17 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: incus-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate and generate matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test Python code
+        run: |
+          python3 -m compileall -q build_pipeline.py scripts tests
+          python3 -m unittest discover -s tests -v
+          bash -n scripts/setup-incus.sh
+      - name: Generate build matrix from manifest
+        id: matrix
+        run: |
+          matrix=$(python3 build_pipeline.py --manifest '镜像.md' --matrix)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$matrix" > build-matrix.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-matrix
+          path: build-matrix.json
+          retention-days: 7
+
+  build:
+    name: ${{ matrix.distro }} ${{ matrix.release }} / ${{ matrix.architecture }}
+    needs: validate
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: '1'
+      TARGET_ARCH: ${{ matrix.architecture }}
+      TARGET_DISTRO: ${{ matrix.distro }}
+      TARGET_RELEASE: ${{ matrix.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install and initialize Incus
+        run: bash scripts/setup-incus.sh
+      - name: Build both all and lite images
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,PYTHONUNBUFFERED \
+            python3 build_pipeline.py --manifest '镜像.md' \
+              --architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO" \
+              --release "$TARGET_RELEASE" --output-dir dist
+      - name: Make export files readable for artifact upload
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist
+          chmod -R u+rwX dist
+      - name: Upload verified image files
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Collect diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          df -h > diagnostics/disk.txt
+          sudo journalctl -u incus --no-pager -n 200 > diagnostics/incus.log 2>&1 || true
+          sudo incus list --format json > diagnostics/instances.json 2>&1 || true
+          if sudo test -f dist/build-summary.json; then
+            sudo cp dist/build-summary.json diagnostics/
+          fi
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
+          path: diagnostics/
+          retention-days: 7
+
+  verify:
+    name: Verify complete dual-architecture build
+    permissions:
+      contents: read
+      actions: read
+    needs: [validate, build]
+    if: ${{ always() && github.event_name != 'pull_request' && needs.validate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require every matrix job to pass
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: test "$BUILD_RESULT" = success
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-matrix
+          path: expected
+      # Download/verify/delete one artifact at a time instead of filling a runner
+      # with all 60 images. Image artifacts remain available from this run.
+      - name: Verify checksums and expected outputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/verify_artifacts.py --matrix expected/build-matrix.json --run-id "$GITHUB_RUN_ID"

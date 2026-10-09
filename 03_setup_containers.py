@@ -27,7 +27,7 @@ def setup_containers():
             ssh_start = "service ssh restart || systemctl restart ssh"
             run_cmd(name, f"{update_cmd} && {ssh_config} && {ssh_start}")
             
-        elif "almalinux" in name or "rockylinux" in name:
+        elif "almalinux" in name or "centos" in name:
             pkg_mgr = "dnf" if ("10" in name or "9" in name or "8" in name) else "yum"
             update_cmd = f"{pkg_mgr} makecache && {pkg_mgr} install -y openssh-server"
             ssh_config = "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"

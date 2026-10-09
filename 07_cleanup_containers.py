@@ -18,7 +18,7 @@ def cleanup_containers():
             pkg_cleanup = "apk cache clean"
         elif "debian" in name or "ubuntu" in name:
             pkg_cleanup = "apt-get clean && rm -rf /var/lib/apt/lists/*"
-        elif "almalinux" in name or "rockylinux" in name:
+        elif "almalinux" in name or "centos" in name:
             pkg_cleanup = "dnf clean all && rm -rf /var/cache/dnf"
         else:
             pkg_cleanup = "true"

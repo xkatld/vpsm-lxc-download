@@ -25,7 +25,7 @@ def install_all_pkgs():
             run_cmd(name, f"apk add {pkgs_apk}")
         elif "debian" in name or "ubuntu" in name:
             run_cmd(name, f"apt update && apt install -y {pkgs_apt}")
-        elif "almalinux" in name or "rockylinux" in name:
+        elif "almalinux" in name or "centos" in name:
             enable_repo = "dnf install -y epel-release && dnf config-manager --set-enabled crb"
             run_cmd(name, f"{enable_repo} && dnf install -y {pkgs_dnf}")
 
