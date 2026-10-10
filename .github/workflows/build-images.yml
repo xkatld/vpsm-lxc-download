@@ -1,4 +1,4 @@
-name: Build Incus images
+name: 构建 Incus 镜像
 
 on:
   pull_request:
@@ -22,33 +22,39 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate and generate matrix
+    name: 检查代码并生成构建矩阵
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Test Python code
+      - name: 检查语法并运行测试
         run: |
+          printf '[开始] 检查 Python 语法。\n'
           python3 -m compileall -q build_pipeline.py scripts tests
-          python3 -m unittest discover -s tests -v
+          printf '[通过] Python 语法检查完成。\n'
+          python3 scripts/run_tests.py
+          printf '[开始] 检查初始化脚本语法。\n'
           bash -n scripts/setup-incus.sh
-      - name: Generate build matrix from manifest
+          printf '[通过] 初始化脚本语法检查完成。\n'
+      - name: 根据镜像清单生成构建矩阵
         id: matrix
         run: |
           matrix=$(python3 build_pipeline.py --manifest '镜像.md' --matrix)
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$matrix" > build-matrix.json
-      - uses: actions/upload-artifact@v4
+      - name: 上传构建矩阵
+        uses: actions/upload-artifact@v4
         with:
           name: build-matrix
           path: build-matrix.json
           retention-days: 7
 
   build:
-    name: ${{ matrix.distro }} ${{ matrix.release }} / ${{ matrix.architecture }}
+    name: 构建 ${{ matrix.distro }} ${{ matrix.release }} / ${{ matrix.architecture }}
     needs: validate
     if: github.event_name != 'pull_request'
     strategy:
@@ -63,12 +69,13 @@ jobs:
       TARGET_DISTRO: ${{ matrix.distro }}
       TARGET_RELEASE: ${{ matrix.release }}
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install and initialize Incus
+      - name: 安装并初始化 Incus
         run: bash scripts/setup-incus.sh
-      - name: Build image with common packages
+      - name: 构建预装通用软件包的镜像
         shell: bash
         run: |
           set -euo pipefail
@@ -78,11 +85,11 @@ jobs:
               --release "$TARGET_RELEASE" --output-dir dist --setup-diagnostics
       # Keep package downloads on the existing IPv4 build network. Enable a
       # private IPv6 subnet only for post-export acceptance; no public IPv6 needed.
-      - name: Enable internal IPv6 for acceptance
+      - name: 启用内部 IPv6 网络用于验收
         run: |
           sudo incus network set incusbr0 ipv6.nat true
           sudo incus network set incusbr0 ipv6.address auto
-      - name: Reimport and accept image over IPv4 and IPv6
+      - name: 重新导入镜像并验收 IPv4 和 IPv6
         id: acceptance
         timeout-minutes: 20
         run: |
@@ -90,14 +97,14 @@ jobs:
             python3 -I scripts/accept_image.py --output-dir dist \
               --architecture "$TARGET_ARCH" --distro "$TARGET_DISTRO" \
               --release "$TARGET_RELEASE" --report-dir acceptance
-      - name: Make acceptance report readable
+      - name: 设置验收报告读取权限
         if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
         run: |
           if sudo test -d acceptance; then
             sudo chown -R "$(id -u):$(id -g)" acceptance
             chmod -R u+rwX acceptance
           fi
-      - name: Upload acceptance report
+      - name: 上传验收报告
         if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
@@ -105,11 +112,11 @@ jobs:
           path: acceptance/
           if-no-files-found: error
           retention-days: 7
-      - name: Make export files readable for artifact upload
+      - name: 设置镜像文件读取权限
         run: |
           sudo chown -R "$(id -u):$(id -g)" dist
           chmod -R u+rwX dist
-      - name: Upload verified image files
+      - name: 上传已验收的镜像文件
         uses: actions/upload-artifact@v4
         with:
           name: images-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
@@ -117,7 +124,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Collect diagnostics on failure
+      - name: 失败时收集诊断信息
         if: failure()
         shell: bash
         run: |
@@ -135,7 +142,7 @@ jobs:
           if sudo test -f dist/build-summary.json; then
             sudo cp dist/build-summary.json diagnostics/
           fi
-      - name: Upload diagnostics
+      - name: 上传诊断信息
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -144,7 +151,7 @@ jobs:
           retention-days: 7
 
   verify:
-    name: Verify complete dual-architecture build
+    name: 验证双架构构建完整性
     permissions:
       contents: read
       actions: read
@@ -152,20 +159,27 @@ jobs:
     if: ${{ always() && github.event_name != 'pull_request' && needs.validate.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Require every matrix job to pass
+      - name: 确认所有矩阵任务通过
         env:
           BUILD_RESULT: ${{ needs.build.result }}
-        run: test "$BUILD_RESULT" = success
-      - uses: actions/download-artifact@v4
+        run: |
+          if [ "$BUILD_RESULT" != success ]; then
+            printf '[错误] 镜像矩阵未全部通过，请查看各任务的中文验收报告。\n'
+            exit 1
+          fi
+          printf '[通过] 所有镜像矩阵任务均已通过。\n'
+      - name: 下载构建矩阵
+        uses: actions/download-artifact@v4
         with:
           name: build-matrix
           path: expected
       # Download/verify/delete one artifact at a time instead of filling a runner
       # with all 30 images. Image artifacts remain available from this run.
-      - name: Verify checksums and expected outputs
+      - name: 验证校验和及预期产物
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

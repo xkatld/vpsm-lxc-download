@@ -49,16 +49,16 @@ def safe_error(exc: BaseException) -> str:
     if isinstance(exc, CheckError):
         return str(exc)
     if isinstance(exc, (AcceptanceTerminated, KeyboardInterrupt)):
-        return "acceptance interrupted"
+        return "验收已中断"
     if isinstance(exc, subprocess.TimeoutExpired):
-        return "command timed out"
+        return "命令执行超时"
     if isinstance(exc, subprocess.CalledProcessError):
-        return "command returned a nonzero exit status"
+        return f"命令执行失败，退出码：{exc.returncode}"
     if isinstance(exc, OSError):
-        return "filesystem or executable operation failed"
+        return "文件或可执行程序操作失败"
     if isinstance(exc, (ValueError, TypeError, KeyError)):
-        return "invalid artifact or runtime data"
-    return "unexpected runtime failure"
+        return "产物或运行数据格式无效"
+    return "发生未预期的运行错误"
 
 
 def parse_os_release(text: str) -> dict[str, str]:
@@ -69,10 +69,10 @@ def parse_os_release(text: str) -> dict[str, str]:
             continue
         key, sep, raw = line.partition("=")
         if not sep or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or key in result:
-            raise CheckError("malformed os-release assignments")
+            raise CheckError("系统版本文件的字段格式错误")
         values = shlex.split(raw, comments=False, posix=True)
         if len(values) > 1:
-            raise CheckError("malformed os-release value")
+            raise CheckError("系统版本文件的字段值无效")
         result[key] = values[0] if values else ""
     return result
 
@@ -80,7 +80,7 @@ def parse_os_release(text: str) -> dict[str, str]:
 def check_os_release(text: str, spec: ImageSpec) -> None:
     values = parse_os_release(text)
     if values.get("ID") != spec.distro:
-        raise CheckError("os-release distribution mismatch")
+        raise CheckError("镜像发行版不匹配")
     version = values.get("VERSION_ID", "")
     codename = values.get("VERSION_CODENAME", "")
     if spec.distro == "debian":
@@ -98,7 +98,7 @@ def check_os_release(text: str, spec: ImageSpec) -> None:
         if spec.distro == "centos":
             valid = valid and "CentOS Stream" in values.get("NAME", "")
     if not valid:
-        raise CheckError("os-release version mismatch")
+        raise CheckError("镜像版本不匹配")
 
 
 def import_paths(root: Path, spec: ImageSpec) -> list[Path]:
@@ -143,24 +143,24 @@ def public_hostkey_fingerprints(text: str) -> dict[str, str]:
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 2:
-            raise CheckError("malformed SSH host public key")
+            raise CheckError("SSH 主机公钥格式无效")
         algorithm = parts[0]
         if algorithm not in {"ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256",
                               "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"} or algorithm in fingerprints:
-            raise CheckError("unsupported or duplicate SSH host public key type")
+            raise CheckError("SSH 主机公钥类型不支持或重复")
         try:
             blob = base64.b64decode(parts[1], validate=True)
         except ValueError:
-            raise CheckError("malformed SSH host public key encoding") from None
+            raise CheckError("SSH 主机公钥编码无效") from None
         # Check the SSH wire-format type and fields, not the filename/comment.
         fields = []
         rest = blob
         while rest:
             if len(rest) < 4:
-                raise CheckError("malformed SSH host public key blob")
+                raise CheckError("SSH 主机公钥二进制数据无效")
             size = int.from_bytes(rest[:4], "big")
             if size == 0 or size > len(rest) - 4:
-                raise CheckError("malformed SSH host public key blob")
+                raise CheckError("SSH 主机公钥二进制数据无效")
             fields.append(rest[4:4 + size])
             rest = rest[4 + size:]
         valid = bool(fields) and fields[0] == algorithm.encode("ascii")
@@ -173,15 +173,32 @@ def public_hostkey_fingerprints(text: str) -> dict[str, str]:
             valid = valid and len(fields) == 3 and fields[1] == curve.encode("ascii")
             valid = valid and len(fields[2]) == {"nistp256": 65, "nistp384": 97, "nistp521": 133}[curve]
         if not valid:
-            raise CheckError("malformed SSH host public key fields")
+            raise CheckError("SSH 主机公钥字段无效")
         fingerprints[algorithm] = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
     if not fingerprints:
-        raise CheckError("no SSH host public keys found")
+        raise CheckError("未发现 SSH 主机公钥")
     return fingerprints
 
 
 class Acceptance:
     READY_TIMEOUT = 120
+    STAGE_NAMES = {
+        "report-directory": "准备验收报告目录", "preflight": "检查运行环境",
+        "verify-export": "校验导出产物", "create-project": "创建隔离验收项目",
+        "profile-root": "配置验收存储", "profile-network": "配置双栈网络",
+        "import-image": "重新导入镜像", "create-instance": "创建验收容器",
+        "os-release": "检查发行版与版本", "packages": "检查预装软件包",
+        "ca-bundle": "检查证书信任库", "readme": "检查镜像说明",
+        "root-lock": "检查初始密码锁定", "credential-backups": "检查账户备份及登录残留",
+        "test-password": "设置验收密码", "restart": "重启验收容器",
+        "identity-stability": "检查重启前后身份不变", "create-clone": "创建独立克隆",
+        "identity-uniqueness": "检查克隆身份不同", "cleanup-project": "清理隔离验收项目",
+        "start": "启动容器", "network": "等待双栈地址",
+        "ssh-ipv4": "验证 IPv4 SSH 登录", "ssh-ipv6": "验证 IPv6 SSH 登录",
+        "sshd-config": "检查 SSH 服务配置", "identity": "采集实例身份摘要",
+    }
+    STATUS_NAMES = {"PASS": "通过", "FAIL": "失败", "NOT_RUN": "未执行",
+                    "success": "通过", "failed": "失败"}
     STAGES = (
         "report-directory", "preflight", "verify-export", "create-project", "profile-root",
         "profile-network", "import-image", "create-instance", "cold-start",
@@ -214,47 +231,85 @@ class Acceptance:
             "addresses": {},
             "identities": {},
             "limitations": [
-                "Only controlled-network IPv4/IPv6 SSH is tested; public IPv6 and HTTPS are not tested.",
-                "Credential backup and root login residue checks inspect the first boot before setting test credentials, not raw archives.",
+                "仅验收内网 IPv4 与 IPv6 SSH，公网 IPv6 和 HTTPS 不属于本次验收范围。",
+                "账户备份与登录残留检查在首次启动后、设置验收密码前执行，不等同于原始归档检查。",
             ],
         }
 
+    @classmethod
+    def stage_name(cls, label: str) -> str:
+        if label in cls.STAGE_NAMES:
+            return cls.STAGE_NAMES[label]
+        for prefix, name in (("cold-", "首次启动"), ("restart-", "重启后"), ("clone-", "独立克隆")):
+            if label.startswith(prefix):
+                return name + "：" + cls.STAGE_NAMES.get(label[len(prefix):], "附加检查")
+        for resource, name in (("instances", "容器"), ("images", "镜像"), ("profiles", "配置")):
+            if label == "cleanup-list-" + resource:
+                return "列出待清理" + name
+            if label.startswith("cleanup-" + resource + "-"):
+                return "清理验收" + name + " " + label.rsplit("-", 1)[-1]
+        return "附加检查"
+
     def redact(self, text: str) -> str:
         for value in sorted(filter(None, self.secrets), key=len, reverse=True):
-            text = text.replace(value, "[REDACTED]")
+            text = text.replace(value, "[已隐藏]")
+        text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|\Z)",
+                      "[已隐藏私钥]", text, flags=re.S)
+        text = re.sub(r"\$(?:[1256]|y|gy|2[aby])\$[^\s:]+", "[已隐藏密码摘要]", text)
+        text = re.sub(r"(?im)(password|token|secret|authorization)(\s*[:=]\s*)[^\s,;]+",
+                      r"\1\2[已隐藏]", text)
         return text
+
+    def diagnostic_text(self, text: str) -> str:
+        text = self.redact(text)
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        text = "".join(char if char.isprintable() or char in "\n\t" else " " for char in text)
+        return text.replace("::", "：：")[:4096]
 
     def step(self, label: str, action: Callable):
         record = next((item for item in self.report["steps"] if item["stage"] == label), None)
         if record is None:
             record = {"stage": label, "status": "NOT_RUN"}
             self.report["steps"].append(record)
-        print(f"[accept:{label}] running", flush=True)
+        record["name"] = self.stage_name(label)
+        print(f"[验收：{record['name']}] 执行中", flush=True)
         try:
             result = action()
         except (Exception, KeyboardInterrupt) as exc:
             record.update(status="FAIL", error=self.redact(safe_error(exc)))
             if "error" not in self.report:
                 self.report["error"] = {"stage": label, "message": record["error"]}
-            print(f"[accept:{label}] FAIL: {record['error']}", flush=True)
+            print(f"[验收：{record['name']}] 失败：{record['error']}", flush=True)
             raise
         record["status"] = "PASS"
-        print(f"[accept:{label}] PASS", flush=True)
+        print(f"[验收：{record['name']}] 通过", flush=True)
         return result
 
     def command(self, args: Sequence[str], *, input: str | None = None,
-                timeout: float = 60, password: bool = False) -> subprocess.CompletedProcess:
+                timeout: float = 60, password: bool = False,
+                diagnose: bool = False) -> subprocess.CompletedProcess:
         if self.deadline is not None:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
-                raise CheckError("overall acceptance deadline exceeded")
+                raise CheckError("验收总时限已到")
             timeout = min(timeout, remaining)
         environment = {key: value for key, value in os.environ.items()
                        if key not in {"IMAGE_ROOT_PASSWORD", "SSHPASS"}}
         if password:
             environment["SSHPASS"] = self.password
-        return subprocess.run(list(args), input=input, text=True, capture_output=True,
-                              check=True, timeout=timeout, env=environment)
+        try:
+            return subprocess.run(list(args), input=input, text=True, capture_output=True,
+                                  check=True, timeout=timeout, env=environment)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if diagnose and not password and input is None:
+                details = exc.stderr or exc.stdout or ""
+                if isinstance(details, bytes):
+                    details = details.decode("utf-8", errors="replace")
+                message = safe_error(exc)
+                if details:
+                    message += "：" + self.diagnostic_text(details)
+                raise CheckError(message) from None
+            raise
 
     def incus(self, args: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
         return self.command(["incus", "--project", self.project, *args], **kwargs)
@@ -264,19 +319,19 @@ class Acceptance:
 
     def prepare_report(self) -> None:
         if self.report_dir == self.output_dir or self.output_dir in self.report_dir.parents:
-            raise CheckError("report directory must be outside the image artifact directory")
+            raise CheckError("验收报告目录不能放在镜像产物目录内")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             path = Path(summary).resolve()
             if path == self.output_dir or self.output_dir in path.parents:
-                raise CheckError("GitHub summary must be outside the image artifact directory")
+                raise CheckError("工作流摘要不能放在镜像产物目录内")
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.report_ready = True
 
     def preflight(self) -> None:
         spec = self.spec
         if spec.architecture not in RUNNERS or NATIVE_ARCHITECTURES.get(platform.machine().lower()) != spec.architecture:
-            raise CheckError("a matching native architecture runner is required")
+            raise CheckError("必须使用与镜像架构匹配的原生运行器")
         valid_release = False
         if spec.distro in RELEASE_DISPLAY:
             valid_release = spec.release in RELEASE_DISPLAY[spec.distro]
@@ -285,12 +340,12 @@ class Acceptance:
         elif spec.distro == "almalinux":
             valid_release = spec.release in {"8", "9", "10"}
         if not valid_release:
-            raise CheckError("unsupported distribution or release")
+            raise CheckError("不支持此发行版或版本")
         if not math.isfinite(self.READY_TIMEOUT) or self.READY_TIMEOUT <= 0:
-            raise CheckError("readiness timeout must be finite and positive")
+            raise CheckError("就绪等待时限必须是有限正数")
         for executable in ("incus", "sshpass", "ssh"):
             if shutil.which(executable) is None:
-                raise CheckError("required incus, sshpass or ssh executable is missing")
+                raise CheckError("缺少必需的 incus、sshpass 或 ssh 程序")
         self.report["image"] = {key: getattr(spec, key) for key in ("distro", "release", "architecture")}
 
     def create_project(self) -> None:
@@ -317,7 +372,7 @@ class Acceptance:
             addresses = instance_addresses(self.incus(
                 ["list", self.instance, "--format", "json"], timeout=timeout).stdout, self.instance)
             return addresses if set(addresses) == {"ipv4", "ipv6"} else None
-        addresses = self.wait(probe, "dual-stack readiness timed out (requires IPv4 and non-link-local IPv6 on eth0)")
+        addresses = self.wait(probe, "双栈地址等待超时，eth0 必须同时具有 IPv4 和非链路本地 IPv6 地址")
         self.report["addresses"][phase] = addresses
         return addresses
 
@@ -328,25 +383,23 @@ class Acceptance:
             elif self.spec.distro in {"debian", "ubuntu"}:
                 result = self.guest(["dpkg-query", "-W", "-f=${Status}", package])
                 if result.stdout.strip() != "install ok installed":
-                    raise CheckError("required package is not installed in the package database")
+                    raise CheckError("必需软件包未处于已安装状态")
             else:
                 self.guest(["rpm", "-q", package])
 
     def check_readme(self) -> None:
         if self.guest(["cat", "/root/README.md"]).stdout != README_CONTENT + "\n":
-            raise CheckError("image README does not exactly match builder content")
+            raise CheckError("镜像说明与构建器约定内容不一致")
 
     def check_root_lock(self) -> None:
         # Shadow data is captured but never returned, logged or persisted.
         rows = [line.split(":") for line in self.guest(["cat", "/etc/shadow"]).stdout.splitlines()
                 if line.split(":", 1)[0] == "root"]
         if len(rows) != 1 or len(rows[0]) != 9 or rows[0][1] != "!":
-            raise CheckError("published root shadow password must be exactly !")
+            raise CheckError("发布镜像的 root 密码锁定字段必须精确为 !")
 
     def check_credential_backups(self) -> None:
-        # Read-only path checks: do not print/read secrets, repair the image, or
-        # reject normal boot-created /tmp entries. -L also catches dangling links.
-        self.guest(["sh", "-c", """set -eu
+        result = self.guest(["sh", "-c", """set -eu
 for path in /etc/shadow- /etc/shadow~ /etc/shadow.bak \\
             /etc/gshadow- /etc/gshadow~ /etc/gshadow.bak \\
             /etc/passwd- /etc/passwd~ /etc/passwd.bak \\
@@ -355,15 +408,20 @@ for path in /etc/shadow- /etc/shadow~ /etc/shadow.bak \\
             /var/backups/passwd* /var/backups/group* \\
             /root/.ssh /root/.bash_history /root/.ash_history /root/.zsh_history; do
     if [ -e "$path" ] || [ -L "$path" ]; then
-        exit 1
+        printf '%s\\n' "$path"
     fi
 done
 """])
+        paths = result.stdout.splitlines()
+        if paths:
+            self.report.setdefault("residue", {})[self.instance] = paths[:64]
+            names = self.diagnostic_text("、".join(paths))
+            raise CheckError("发现账户备份或登录残留：" + names)
 
     def ssh(self, family: int, address: str) -> None:
         parsed = ipaddress.ip_address(address)
         if family not in (4, 6) or parsed.version != family:
-            raise CheckError("SSH address family mismatch")
+            raise CheckError("SSH 连接地址族不匹配")
         def probe(timeout: float):
             result = self.command([
                 "sshpass", "-e", "ssh", f"-{family}", "-F", "/dev/null",
@@ -374,7 +432,7 @@ done
                 "-o", "LogLevel=ERROR", f"root@{address}", "whoami",
             ], timeout=timeout, password=True)
             return result.stdout.strip() == "root"
-        self.wait(probe, "SSH password authentication or root identity check timed out")
+        self.wait(probe, "SSH 密码登录或 root 身份检查超时")
 
     def check_boot(self, phase: str, addresses: dict[str, str]) -> None:
         self.step(phase + "-ssh-ipv4", lambda: self.ssh(4, addresses["ipv4"]))
@@ -387,7 +445,7 @@ done
         # Read only runtime guest identities, never image properties or private keys.
         machine_id = self.guest(["cat", "/etc/machine-id"]).stdout
         if not re.fullmatch(r"[0-9a-f]{32}\n?", machine_id) or machine_id.rstrip("\n") == "0" * 32:
-            raise CheckError("machine-id must be a nonzero lowercase 32-hex value")
+            raise CheckError("机器标识必须是非全零的 32 位小写十六进制值")
         public_keys = self.guest(["sh", "-c", """set -eu
 for path in /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_rsa_key.pub /etc/ssh/ssh_host_ecdsa_key.pub; do
     if [ -e "$path" ] || [ -L "$path" ]; then
@@ -408,18 +466,18 @@ done
     @staticmethod
     def check_identity_stability(initial: dict, restarted: dict) -> None:
         if initial != restarted:
-            raise CheckError("machine-id or SSH host public keys changed across restart")
+            raise CheckError("重启前后机器标识或 SSH 主机公钥发生变化")
 
     @staticmethod
     def check_identity_uniqueness(primary: dict, clone: dict) -> None:
         if primary["machine_id_sha256"] == clone["machine_id_sha256"]:
-            raise CheckError("clones share the same machine-id")
+            raise CheckError("独立克隆使用了相同的机器标识")
         first = primary["ssh_host_key_fingerprints"]
         second = clone["ssh_host_key_fingerprints"]
         if not first or first.keys() != second.keys():
-            raise CheckError("clones must expose the same nonempty set of SSH host public key types")
+            raise CheckError("独立克隆必须提供相同且非空的 SSH 主机公钥类型集合")
         if set(first.values()) & set(second.values()):
-            raise CheckError("clones share an SSH host public key")
+            raise CheckError("独立克隆使用了相同的 SSH 主机公钥")
 
     def check_clone(self, primary_identity: dict) -> None:
         primary_instance, primary_password = self.instance, self.password
@@ -440,6 +498,40 @@ done
             self.step("identity-uniqueness", lambda: self.check_identity_uniqueness(primary_identity, identity))
         finally:
             self.instance, self.password = primary_instance, primary_password
+
+    def collect_diagnostics(self) -> None:
+        if not self.project_created:
+            return
+        probes = [("验收项目资源", ["list", "--format", "json"])]
+        for instance in (self.instance, self.clone_instance):
+            probes.append((instance + " 启动日志", ["info", instance, "--show-log"]))
+            probes.append((instance + " 账户路径元数据", ["exec", instance, "--", "sh", "-c", """
+for path in /etc/shadow /etc/gshadow /etc/passwd /etc/group \\
+            /etc/shadow- /etc/gshadow- /etc/passwd- /etc/group- \\
+            /var/backups/shadow* /var/backups/gshadow* /var/backups/passwd* /var/backups/group* \\
+            /root/.ssh /root/.bash_history /root/.ash_history /root/.zsh_history; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        stat -c '%n | %F | %s | %y | %z' -- "$path" || exit 1
+    fi
+done
+"""]))
+            if self.spec.distro != "alpine":
+                probes.append((instance + " 首次启动服务日志", ["exec", instance, "--", "journalctl",
+                    "-b", "--no-pager", "-n", "60", "-u", "systemd-firstboot.service",
+                    "-u", "systemd-sysusers.service", "-u", "vpsm-firstboot.service",
+                    "-u", "ssh.service", "-u", "sshd.service"]))
+        records = self.report.setdefault("diagnostics", [])
+        for name, args in probes:
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                records.append({"name": "故障取证", "error": "已达到取证时限"})
+                break
+            try:
+                result = self.incus(args, timeout=5)
+                text = self.diagnostic_text(result.stdout)
+                records.append({"name": name, "output": text})
+                print(f"[诊断：{name}]\n{text}", flush=True)
+            except Exception as exc:
+                records.append({"name": name, "error": safe_error(exc)})
 
     def cleanup(self) -> bool:
         if not self.project_created:
@@ -478,12 +570,19 @@ done
         path.write_text(self.redact(json.dumps(self.report, ensure_ascii=False, indent=2)) + "\n", encoding="utf-8")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
-            rows = ["## Exported image acceptance", "", f"Status: **{self.report['status']}**", "",
-                    "| Stage | Result |", "|---|---|"]
-            rows += [f"| {item['stage']} | {item['status']} |" for item in self.report["steps"]]
+            rows = ["## 导出镜像验收", "", f"结果：**{self.STATUS_NAMES[self.report['status']]}**", "",
+                    "| 验收项目 | 结果 |", "|---|---|"]
+            rows += [f"| {self.stage_name(item['stage'])} | {self.STATUS_NAMES[item['status']]} |"
+                     for item in self.report["steps"]]
             if "error" in self.report:
                 error = self.report["error"]
-                rows += ["", f"Failure: {error['stage']}: {error['message']}"]
+                rows += ["", f"失败项目：{self.stage_name(error['stage'])}",
+                         "", "```text", error['message'].replace("```", "｀｀｀"), "```"]
+            if self.report.get("diagnostics"):
+                rows += ["", "### 清理前故障取证"]
+                for item in self.report["diagnostics"]:
+                    rows += ["", item["name"], "```text",
+                             item.get("output", item.get("error", "")).replace("```", "｀｀｀"), "```"]
             rows += ["", *self.report["limitations"], ""]
             with open(summary, "a", encoding="utf-8") as handle:
                 handle.write(self.redact("\n".join(rows)) + "\n")
@@ -506,7 +605,7 @@ done
             self.step("profile-network", lambda: self.incus([
                 "profile", "device", "add", "default", "eth0", "nic", "network=incusbr0", "name=eth0"]))
             self.step("import-image", lambda: self.incus([
-                "image", "import", *map(str, paths), "--alias", self.alias], timeout=300))
+                "image", "import", *map(str, paths), "--alias", self.alias], timeout=300, diagnose=True))
             self.step("create-instance", lambda: self.incus([
                 "init", self.alias, self.instance, "--profile", "default", "-c", "security.privileged=false"], timeout=180))
             self.step("cold-start", lambda: self.incus(["start", self.instance], timeout=90))
@@ -535,6 +634,12 @@ done
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
+                self.deadline = time.monotonic() + 20
+                if self.report["status"] != "success":
+                    try:
+                        self.collect_diagnostics()
+                    except Exception:
+                        print("[诊断] 取证未完成，继续清理验收资源", flush=True)
                 self.deadline = time.monotonic() + 90
                 if not self.cleanup():
                     self.report["status"] = "failed"
@@ -543,7 +648,7 @@ done
                         self.write_report()
                     except Exception:
                         self.report["status"] = "failed"
-                        print("[accept:report] FAIL: could not write acceptance report/summary", flush=True)
+                        print("[验收报告] 失败：无法写入验收报告或工作流摘要", flush=True)
             finally:
                 signal.signal(signal.SIGTERM, previous)
                 signal.signal(signal.SIGINT, old_int)
@@ -551,7 +656,7 @@ done
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="在原生运行器重新导入镜像并验收内网双栈及实例身份")
     parser.add_argument("--output-dir", type=Path, default=Path("dist"))
     parser.add_argument("--report-dir", type=Path, default=Path("acceptance"))
     parser.add_argument("--distro", required=True)

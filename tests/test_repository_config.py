@@ -22,7 +22,7 @@ class RepositoryConfigTests(unittest.TestCase):
         build = text.index("python3 build_pipeline.py --manifest", text.index("  build:"))
         ipv6 = text.index("incus network set incusbr0 ipv6.address auto")
         acceptance = text.index("python3 -I scripts/accept_image.py")
-        upload = text.index("- name: Upload verified image files")
+        upload = text.index("- name: 上传已验收的镜像文件")
         self.assertLess(build, ipv6)
         self.assertLess(ipv6, acceptance)
         self.assertLess(acceptance, upload)

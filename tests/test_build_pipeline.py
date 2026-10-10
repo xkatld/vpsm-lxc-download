@@ -482,7 +482,7 @@ class SetupReadinessTests(HermeticTestCase):
         now, sleep = self.fake_clock()
         pipeline = self.pipeline(ssh_timeout=5)
         self.subprocess.side_effect = subprocess.CalledProcessError(1, ["private argv"], stderr="DNS unavailable")
-        with self.assertRaisesRegex(build_pipeline.SetupStepError, r"\[package-index\] readiness timed out"):
+        with self.assertRaisesRegex(build_pipeline.SetupStepError, r"\[package-index\] 等待就绪超时"):
             pipeline.setup_one(self.spec, "owned")
         self.assertEqual(now[0], 5)
         self.assertEqual([item.kwargs["timeout"] for item in self.subprocess.call_args_list], [5, 3, 1])
@@ -504,7 +504,7 @@ class SetupReadinessTests(HermeticTestCase):
         self.assertEqual([item.kwargs["timeout"] for item in self.subprocess.call_args_list], [30, 3])
         sleep.assert_called_once_with(2)
         self.assertIn("DNS still unavailable", str(raised.exception))
-        self.assertIn("external command timed out", str(raised.exception))
+        self.assertIn("外部命令执行超时", str(raised.exception))
 
     def test_index_timeout_can_recover(self):
         self.fake_clock()
@@ -522,7 +522,7 @@ class SetupReadinessTests(HermeticTestCase):
             return completed()
 
         self.subprocess.side_effect = late_success
-        with self.assertRaisesRegex(build_pipeline.SetupStepError, "readiness timed out"):
+        with self.assertRaisesRegex(build_pipeline.SetupStepError, "等待就绪超时"):
             pipeline.wait_for_package_index("owned", "apk update")
         self.subprocess.assert_called_once()
         sleep.assert_not_called()
@@ -557,7 +557,7 @@ class SetupReadinessTests(HermeticTestCase):
                 with self.assertRaises(build_pipeline.SetupStepError) as raised:
                     self.pipeline().setup_one(spec_for("alpine", "3.21"), "owned")
                 self.assertIn(f"[{label}]", str(raised.exception))
-                self.assertIn("exit 7", str(raised.exception))
+                self.assertIn("退出码：7", str(raised.exception))
                 self.assertEqual(sum(marker in item.args[0][-1] for item in self.subprocess.call_args_list), 1)
                 self.assertIn(marker, self.subprocess.call_args.args[0][-1])
         sleep.assert_not_called()
@@ -586,7 +586,7 @@ class SetupDiagnosticTests(HermeticTestCase):
         self.subprocess.side_effect = subprocess.CalledProcessError(2, ["ARGV"], output="STDOUT", stderr="STDERR")
         with self.assertRaises(build_pipeline.SetupStepError) as raised:
             self.pipeline().setup_step("owned", "ssh-install", "apk add openssh")
-        self.assertEqual(str(raised.exception), "setup step [ssh-install] failed: external command failed (exit 2)")
+        self.assertEqual(str(raised.exception), "配置步骤 [ssh-install] 失败：外部命令执行失败，退出码：2")
         self.assertTrue(raised.exception.__suppress_context__)
 
     def test_diagnostics_redact_all_credentials_escape_controls_and_prefix_lines(self):
@@ -606,7 +606,7 @@ class SetupDiagnosticTests(HermeticTestCase):
             self.assertIn("[REDACTED]", message)
             self.assertNotIn("::", message)
             self.assertNotIn("##[", message)
-            self.assertTrue(all(line.startswith("  setup stderr | ") for line in message.splitlines()[1:]))
+            self.assertTrue(all(line.startswith("  配置标准错误 | ") for line in message.splitlines()[1:]))
             self.assertTrue(all(c == "\n" or c.isprintable() for c in message))
             for escaped in (r"\r", r"\x1b", r"\x00", r"\x08", r"\x85", ascii(chr(0x2028))[1:-1], ascii(chr(0x202E))[1:-1]):
                 self.assertIn(escaped, message)
@@ -616,18 +616,18 @@ class SetupDiagnosticTests(HermeticTestCase):
         pipeline = self.pipeline(setup_diagnostics=True, root_password="UNIQUE-PASSWORD-CROSSING-CLIP")
         text = pipeline.safe_setup_stderr("x" * 2020 + pipeline.root_password + "z" * 10000)
         self.assertNotIn("UNIQUE", text)
-        self.assertIn("[truncated]", text)
+        self.assertIn("[已截断]", text)
         self.assertLess(len(text), 2100)
         text = pipeline.safe_setup_stderr("::error::injected\n" * 10000)
         self.assertLessEqual(len(text.splitlines()), 13)
-        self.assertTrue(all(line.startswith("  setup stderr | ") for line in text.splitlines()))
+        self.assertTrue(all(line.startswith("  配置标准错误 | ") for line in text.splitlines()))
 
     def test_chpasswd_remains_private_even_with_diagnostics_enabled(self):
         pipeline = self.pipeline(setup_diagnostics=True)
         self.subprocess.side_effect = subprocess.CalledProcessError(1, ["ARGV"], output="STDOUT", stderr="PRIVATE_PASSWORD_OUTPUT")
         with self.assertRaises(build_pipeline.SetupStepError) as raised:
             pipeline.setup_step("owned", "chpasswd")
-        self.assertEqual(str(raised.exception), "setup step [chpasswd] failed: external command failed (exit 1)")
+        self.assertEqual(str(raised.exception), "配置步骤 [chpasswd] 失败：外部命令执行失败，退出码：1")
         self.assertEqual(self.subprocess.call_args.kwargs["input"], f"root:{self.password}\n")
         # Defense in depth: stdin-bearing calls cannot opt in accidentally either.
         with self.assertRaises(build_pipeline.IncusCommandError) as raised:
@@ -641,7 +641,7 @@ class SetupDiagnosticTests(HermeticTestCase):
                        lambda: pipeline.install_common_packages(), lambda: pipeline.cleanup_containers()):
             with self.assertRaises(build_pipeline.IncusCommandError) as raised:
                 action()
-            self.assertEqual(str(raised.exception), "external command failed (exit 1)")
+            self.assertEqual(str(raised.exception), "外部命令执行失败，退出码：1")
 
     def test_safe_setup_error_printed_and_persisted_without_raw_main_errors(self):
         pipeline = self.pipeline(setup_diagnostics=True)
@@ -957,34 +957,103 @@ class SanitizationAndExportTests(HermeticTestCase):
                 with patch.object(pipeline, "exec_container", return_value=completed()) as execute:
                     pipeline.cleanup_containers()
                 self.assertEqual(pipeline.sanitized_containers, set(pipeline.containers))
-                for item in execute.call_args_list:
-                    command = item.args[1]
-                    self.assertIn("root:!", command)
-                    self.assertIn("chpasswd -e", command)
-                    for database in ("shadow", "gshadow", "passwd", "group"):
-                        for suffix in ("-", "~", ".bak"):
-                            self.assertIn(f"/etc/{database}{suffix}", command)
-                        self.assertIn(f"/var/backups/{database}*", command)
-                    self.assertIn('test ! -e "$path" && test ! -L "$path"', command)
-                    self.assertIn('"$directory"/.[!.]*', command)
-                    self.assertIn('"$directory"/..?*', command)
-                    self.assertIn('test ! -L "$directory"', command)
-                    self.assertNotIn('"$directory"/.*', command)
-                    self.assertIn("/root/.ssh", command)
-                    self.assertIn(pipeline.first_boot_identity_command(spec_for(distro, release)), command)
-                    self.assertIn('for path in /etc/ssh/ssh_host_*; do\n    rm -f -- "$path"', command)
-                    self.assertIn("rm -f /var/lib/dbus/machine-id\nln -s /etc/machine-id /var/lib/dbus/machine-id", command)
-                    self.assertLess(command.index("ssh-keygen -A"), command.index("for path in /etc/ssh/ssh_host_*"))
-                    if distro == "alpine":
-                        self.assertLess(command.index("rc-service sshd stop"), command.index("for path in /etc/ssh/ssh_host_*"))
-                    else:
-                        self.assertIn("for unit in ssh.socket sshd.socket ssh.service sshd.service; do", command)
-                        self.assertIn('load_state=$(systemctl show "$unit" --property=LoadState --value)', command)
-                        self.assertIn('if test "$load_state" != not-found; then\n        systemctl stop "$unit"', command)
-                        self.assertLess(command.index('systemctl stop "$unit"'), command.index("for path in /etc/ssh/ssh_host_*"))
-                    self.assertNotIn("|| true", command)
-                    self.assertNotIn("systemctl disable", command)
-                    self.assertNotIn(self.password, command)
+                self.assertEqual(execute.call_count, 2)
+                cleanup, review = execute.call_args_list
+                self.assertEqual(cleanup.args[0], pipeline.containers[0])
+                self.assertEqual(cleanup.kwargs, {"quiet": True})
+                self.assertEqual(review.args[0], pipeline.containers[0])
+                self.assertEqual(review.kwargs, {})
+                command = cleanup.args[1]
+                self.assertIn("root:!", command)
+                self.assertIn("chpasswd -e", command)
+                for database in ("shadow", "gshadow", "passwd", "group"):
+                    for suffix in ("-", "~", ".bak"):
+                        self.assertIn(f"/etc/{database}{suffix}", command)
+                        self.assertIn(f"/etc/{database}{suffix}", review.args[1])
+                    self.assertIn(f"/var/backups/{database}*", command)
+                    self.assertIn(f"/var/backups/{database}*", review.args[1])
+                self.assertIn('test ! -e "$path" && test ! -L "$path"', command)
+                self.assertIn('"$directory"/.[!.]*', command)
+                self.assertIn('"$directory"/..?*', command)
+                self.assertIn('test ! -L "$directory"', command)
+                self.assertNotIn('"$directory"/.*', command)
+                self.assertIn("/root/.ssh", command)
+                self.assertIn("for conf in /usr/lib/tmpfiles.d/*.conf /etc/tmpfiles.d/*.conf; do", command)
+                self.assertIn("test -e \"$conf\" || continue", command)
+                self.assertIn("grep -q -F '/root/.ssh' \"$conf\"", command)
+                self.assertIn("sed -i -e '\\%/root/[.]ssh%d' \"$conf\"", command)
+                self.assertLess(command.index("/usr/lib/tmpfiles.d/*.conf"), command.index("for path in /etc/shadow-"))
+                self.assertIn("for conf in /usr/lib/tmpfiles.d/*.conf /etc/tmpfiles.d/*.conf; do", review.args[1])
+                self.assertIn("grep -q -F '/root/.ssh' \"$conf\"", review.args[1])
+                self.assertIn(pipeline.first_boot_identity_command(spec_for(distro, release)), command)
+                self.assertIn('for path in /etc/ssh/ssh_host_*; do\n    rm -f -- "$path"', command)
+                self.assertIn("rm -f /var/lib/dbus/machine-id\nln -s /etc/machine-id /var/lib/dbus/machine-id", command)
+                self.assertLess(command.index("ssh-keygen -A"), command.index("for path in /etc/ssh/ssh_host_*"))
+                if distro == "alpine":
+                    self.assertLess(command.index("rc-service sshd stop"), command.index("for path in /etc/ssh/ssh_host_*"))
+                else:
+                    self.assertIn("for unit in ssh.socket sshd.socket ssh.service sshd.service; do", command)
+                    self.assertIn('load_state=$(systemctl show "$unit" --property=LoadState --value)', command)
+                    self.assertIn('if test "$load_state" != not-found; then\n        systemctl stop "$unit"', command)
+                    self.assertLess(command.index('systemctl stop "$unit"'), command.index("for path in /etc/ssh/ssh_host_*"))
+                self.assertNotIn("|| true", command)
+                self.assertNotIn("systemctl disable", command)
+                self.assertNotIn(self.password, command)
+                self.assertTrue(review.args[1].startswith("set -eu\n"))
+                self.assertIn('if test -e "$path" || test -L "$path"; then', review.args[1])
+                self.assertIn("printf '%s\\n' \"$path\"", review.args[1])
+                for path in ("/root/.ssh", "/root/.bash_history", "/root/.ash_history", "/root/.zsh_history"):
+                    self.assertIn(path, review.args[1])
+                self.assertNotIn("rm ", review.args[1])
+                self.assertNotIn("|| true", review.args[1])
+                self.assertNotIn(self.password, review.args[1])
+
+    def test_final_cleanup_review_marks_safe_only_after_empty_result(self):
+        for stdout in ("", "\n", " \t\n"):
+            with self.subTest(stdout=stdout):
+                pipeline = self.pipeline()
+                container = pipeline.containers[0]
+                calls = []
+
+                def execute(name, command, **kwargs):
+                    self.assertEqual(name, container)
+                    self.assertEqual(pipeline.sanitized_containers, set())
+                    calls.append(command)
+                    if len(calls) == 1:
+                        self.assertIn("chpasswd -e", command)
+                        return completed()
+                    self.assertEqual(len(calls), 2)
+                    self.assertIn('if test -e "$path" || test -L "$path"; then', command)
+                    return completed(stdout)
+
+                with patch.object(pipeline, "exec_container", side_effect=execute) as execute_mock:
+                    pipeline.cleanup_containers()
+                self.assertEqual(execute_mock.call_count, 2)
+                self.assertEqual(pipeline.sanitized_containers, {container})
+                self.subprocess.assert_not_called()
+
+    def test_final_cleanup_review_residuals_prevent_sanitization_and_publish(self):
+        for residuals in ("/etc/shadow-\n/root/.ssh", "/var/backups/group.bak", "/root/.bash_history"):
+            with self.subTest(residuals=residuals):
+                pipeline = self.pipeline()
+                log = io.StringIO()
+                expected = "最终清理复核发现残留路径：\n" + "\n".join(
+                    "  配置标准错误 | " + path for path in residuals.splitlines()
+                )
+                with patch.object(pipeline, "exec_container", side_effect=[completed(), completed(residuals)]) as execute, contextlib.redirect_stderr(log):
+                    with self.assertRaises(RuntimeError) as raised:
+                        pipeline.cleanup_containers()
+                self.assertEqual(execute.call_count, 2)
+                self.assertEqual(str(raised.exception), expected)
+                self.assertEqual(log.getvalue(), expected + "\n")
+                self.assertEqual(pipeline.sanitized_containers, set())
+                with patch.object(pipeline, "incus") as incus:
+                    with self.assertRaisesRegex(RuntimeError, "^测试凭据尚未清除，拒绝发布$"):
+                        pipeline.publish_and_export()
+                incus.assert_not_called()
+                self.assertEqual(pipeline.created_published_aliases, [])
+                self.assertEqual(pipeline.exported_files, [])
+                self.subprocess.assert_not_called()
 
     def test_identity_is_reset_on_stopped_rootfs_before_publish_for_every_release(self):
         for distro, release in RELEASES:
@@ -1001,12 +1070,20 @@ class SanitizationAndExportTests(HermeticTestCase):
                     calls.append((args, kwargs))
                     if args[0] == "exec":
                         self.assertTrue(state["running"])
-                        self.assertIn("for path in /etc/ssh/ssh_host_*", args[-1])
-                        self.assertIn("ln -s /etc/machine-id /var/lib/dbus/machine-id", args[-1])
-                        state["keys"] = False
+                        self.assertEqual(pipeline.sanitized_containers, set())
+                        if len(calls) == 1:
+                            self.assertIn("for path in /etc/ssh/ssh_host_*", args[-1])
+                            self.assertIn("ln -s /etc/machine-id /var/lib/dbus/machine-id", args[-1])
+                            state["keys"] = False
+                        else:
+                            self.assertEqual(len(calls), 2)
+                            self.assertFalse(state["keys"])
+                            self.assertIn('if test -e "$path" || test -L "$path"; then', args[-1])
+                            self.assertNotIn("ssh-keygen -A", args[-1])
                     elif args[0] == "stop":
                         self.assertEqual(args, ["stop", container, "--force"])
                         self.assertFalse(state["keys"])
+                        self.assertEqual(pipeline.sanitized_containers, {container})
                         state["running"] = False
                         # Simulate any last runtime commit; a live-only reset fails.
                         state["machine_id"] = "b" * 32
@@ -1023,7 +1100,7 @@ class SanitizationAndExportTests(HermeticTestCase):
                 with patch.object(pipeline, "incus", side_effect=invoke):
                     pipeline.cleanup_containers()
                     pipeline.publish_and_export()
-                self.assertEqual([args[0] for args, _ in calls], ["exec", "stop", "file", "publish", "image"])
+                self.assertEqual([args[0] for args, _ in calls], ["exec", "exec", "stop", "file", "publish", "image"])
 
     def test_failed_stop_or_machine_id_reset_prevents_publish(self):
         for failed_action in ("stop", "file"):
@@ -1132,6 +1209,51 @@ class SanitizationAndExportTests(HermeticTestCase):
         self.assertEqual(len(summary["images"]), 1)
         self.assertNotIn("variants", summary)
         self.assertNotIn(self.password, json.dumps(summary))
+
+    def test_failed_summary_displays_safe_chinese_reason_and_preserves_status(self):
+        pipeline = self.prepared_pipeline()
+        summary_file = self.root / "step-summary.md"
+        error = f"安装失败 <script> & > {self.password}\n后续诊断"
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary_file)}):
+            pipeline.write_summary("failed", error)
+        summary = json.loads((self.output / "build-summary.json").read_text())
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["error"], "安装失败 <script> & > [REDACTED]\n后续诊断")
+        text = summary_file.read_text()
+        self.assertEqual(text, (
+            "## Incus 镜像构建\n\n- 状态：**失败**\n- 架构：**arm64**\n"
+            "\n### 失败原因\n\n"
+            ">   配置标准错误 | 安装失败 &lt;script&gt; &amp; &gt; [REDACTED]\n"
+            ">   配置标准错误 | 后续诊断\n"
+        ))
+        self.assertNotIn(self.password, text)
+        self.subprocess.assert_not_called()
+
+    def test_failed_summary_bounds_and_redacts_reason_before_rendering(self):
+        pipeline = self.prepared_pipeline(root_password="UNIQUE-PASSWORD-CROSSING-CLIP")
+        for name, error in (
+            ("long", "x" * 2020 + pipeline.root_password + "z" * 10000),
+            ("multiline", "::error::注入\r\x1b\n" * 10000),
+        ):
+            with self.subTest(name=name):
+                summary_file = self.root / f"{name}-summary.md"
+                with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary_file)}):
+                    pipeline.write_summary("failed", error)
+                text = summary_file.read_text()
+                detail = text.split("\n### 失败原因\n\n", 1)[1]
+                self.assertIn(">   配置标准错误 | [已截断]\n", detail)
+                self.assertLess(len(detail), 2100)
+                self.assertLessEqual(len(detail.splitlines()), 13)
+                self.assertTrue(all(line.startswith(">   配置标准错误 | ") for line in detail.splitlines()))
+                self.assertNotIn("UNIQUE", detail)
+                self.assertNotIn("::", detail)
+                self.assertTrue(all(character == "\n" or character.isprintable() for character in detail))
+                if name == "multiline":
+                    self.assertIn(r"\x3a\x3aerror\x3a\x3a注入\r\x1b", detail)
+                summary = json.loads((self.output / "build-summary.json").read_text())
+                self.assertEqual(summary["status"], "failed")
+                self.assertNotIn(pipeline.root_password, summary["error"])
+        self.subprocess.assert_not_called()
 
 
 class RunLifecycleTests(HermeticTestCase):

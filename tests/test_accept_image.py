@@ -62,6 +62,7 @@ class FakeRunner:
         self.readme = README_CONTENT + "\n"
         self.shadow = "root:!:20000:0:99999:7:::\n"
         self.package_status = "install ok installed"
+        self.residue = ""
         self.login = "root\n"
         self.machine_ids = {"cold": "1a" * 16 + "\n", "restart": "1a" * 16 + "\n", "clone": "2b" * 16 + "\n"}
         self.host_keys = {"cold": public_keys(), "restart": public_keys(), "clone": public_keys(2)}
@@ -103,6 +104,8 @@ class FakeRunner:
                     output = self.readme
                 elif guest == ["cat", "/etc/shadow"]:
                     output = self.shadow
+                elif guest[:2] == ["sh", "-c"] and "/etc/shadow-" in guest[2] and "stat -c" not in guest[2]:
+                    output = self.residue
                 elif guest[:1] == ["dpkg-query"]:
                     output = self.package_status
         return subprocess.CompletedProcess(command, 0, output, "")
@@ -143,7 +146,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(report["status"], "success")
         self.assertTrue(all(step["status"] == "PASS" for step in report["steps"]))
         self.assertEqual(original, {path.name: path.read_bytes() for path in self.dist.iterdir()})
-        self.assertIn("public IPv6", self.summary.read_text())
+        self.assertIn("公网 IPv6", self.summary.read_text())
         commands = [cmd for cmd, _ in self.fake.commands]
         project = self.accept.project
         creation = next(cmd for cmd in commands if "create" in cmd)
@@ -282,7 +285,7 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertEqual(self.accept.report["identities"], {})
         self.fake.machine_ids["cold"] = "1a" * 16 + "\n"
         self.fake.host_keys["cold"] = "\n"
-        with self.assertRaisesRegex(CheckError, "no SSH host public keys"):
+        with self.assertRaisesRegex(CheckError, "未发现 SSH 主机公钥"):
             self.accept.sample_identity("cold")
 
     def test_clone_without_keys_or_same_key_set_cannot_pass(self):
@@ -420,10 +423,10 @@ class AcceptanceTests(unittest.TestCase):
                      "/root/.ssh", "/root/.bash_history", "/root/.ash_history", "/root/.zsh_history"):
             self.assertIn(path, script)
         self.assertIn('[ -e "$path" ] || [ -L "$path" ]', script)
-        for forbidden in ("rm ", "cat ", "echo ", "printf ", "/tmp", "chpasswd"):
+        for forbidden in ("rm ", "cat ", "echo ", "/tmp", "chpasswd"):
             self.assertNotIn(forbidden, script)
         self.assertLess(check_index, next(i for i, cmd in enumerate(commands) if "chpasswd" in cmd))
-        self.assertIn("not raw archives", " ".join(self.report()["limitations"]))
+        self.assertIn("不等同于原始归档检查", " ".join(self.report()["limitations"]))
 
     def test_credential_residue_failure_blocks_password_and_cleans_without_leaking(self):
         def fail(cmd, kwargs):
@@ -527,9 +530,67 @@ class AcceptanceTests(unittest.TestCase):
     def test_overall_deadline_bounds_commands_without_invoking_them(self):
         self.accept.deadline = 10
         with patch("scripts.accept_image.time.monotonic", return_value=11):
-            with self.assertRaisesRegex(CheckError, "overall acceptance deadline"):
+            with self.assertRaisesRegex(CheckError, "验收总时限已到"):
                 self.accept.guest(["true"])
         self.assertEqual(self.fake.commands, [])
+
+    def test_chinese_console_summary_preserve_machine_status(self):
+        self.assertEqual(self.accept.run(), 0)
+        self.assertIn("[验收：重新导入镜像] 通过", self.console.getvalue())
+        self.assertIn("首次启动：验证 IPv6 SSH 登录", self.summary.read_text())
+        self.assertIn("结果：**通过**", self.summary.read_text())
+        self.assertNotIn("[accept:", self.console.getvalue())
+        self.assertEqual(self.report()["status"], "success")
+        self.assertTrue(all(row["status"] == "PASS" for row in self.report()["steps"]))
+
+    def test_residue_paths_are_reported_without_reading_or_repairing(self):
+        self.fake.residue = "/etc/gshadow-\n/root/.ssh\n"
+        self.assertEqual(self.accept.run(), 1)
+        self.assertEqual(self.report()["error"]["stage"], "credential-backups")
+        self.assertIn("/etc/gshadow-", self.report()["error"]["message"])
+        self.assertIn("/root/.ssh", self.summary.read_text())
+        commands = [cmd for cmd, _ in self.fake.commands]
+        self.assertFalse(any("chpasswd" in cmd for cmd in commands))
+        self.assertFalse(any(cmd[-2:] == ["cat", "/etc/gshadow-"] for cmd in commands))
+        diagnostics = next(i for i, cmd in enumerate(commands) if cmd[3:4] == ["info"])
+        cleanup = next(i for i, cmd in enumerate(commands) if cmd[3:4] == ["delete"])
+        self.assertLess(diagnostics, cleanup)
+        self.assertTrue(self.report()["diagnostics"])
+
+    def test_import_error_preserves_bounded_redacted_detail(self):
+        def fail(cmd, kwargs):
+            if cmd[3:5] == ["image", "import"]:
+                raise subprocess.CalledProcessError(7, cmd, stderr=(
+                    "import rejected ::error:: " + self.accept.password + " " + "x" * 6000))
+        self.fake.failure = fail
+        self.assertEqual(self.accept.run(), 1)
+        message = self.report()["error"]["message"]
+        self.assertIn("退出码：7", message)
+        self.assertIn("import rejected", message)
+        self.assertNotIn(self.accept.password, message)
+        self.assertNotIn("::error::", message)
+        self.assertLess(len(message), 4200)
+
+    def test_sensitive_command_never_exposes_output_even_when_diagnose_enabled(self):
+        def fail(cmd, kwargs):
+            raise subprocess.CalledProcessError(1, cmd, stderr="private-shadow-content")
+        self.fake.failure = fail
+        for kwargs in ({"password": True}, {"input": "root:secret"}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    self.accept.command(["sensitive"], diagnose=True, **kwargs)
+                self.assertNotIn("private-shadow-content", safe_error(caught.exception))
+
+    def test_diagnostic_failure_does_not_mask_original_failure_or_skip_cleanup(self):
+        self.fake.residue = "/etc/shadow-\n"
+        def fail(cmd, kwargs):
+            if cmd[3:4] == ["info"] or "stat -c" in cmd[-1]:
+                raise subprocess.TimeoutExpired(cmd, 5, output="private-diagnostic-content")
+        self.fake.failure = fail
+        self.assertEqual(self.accept.run(), 1)
+        self.assertEqual(self.report()["error"]["stage"], "credential-backups")
+        self.assertFalse(self.accept.project_created)
+        self.assertNotIn("private-diagnostic-content", json.dumps(self.report()))
 
     def test_main_supports_parent_cli(self):
         with patch.object(Acceptance, "run", return_value=0) as run:

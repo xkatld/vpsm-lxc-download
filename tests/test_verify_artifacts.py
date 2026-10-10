@@ -55,7 +55,7 @@ class ArtifactTests(unittest.TestCase):
             with self.subTest(suffixes=suffixes), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 self.fixture(root, [self.prefix + suffix for suffix in suffixes])
-                with self.assertRaisesRegex(ValueError, "unexpected export file set"):
+                with self.assertRaisesRegex(ValueError, "导出文件组合不符合预期"):
                     verify_artifact(root, self.row)
 
     def test_old_flavors_and_inexact_prefixes_fail(self):
@@ -67,7 +67,7 @@ class ArtifactTests(unittest.TestCase):
                     root = Path(directory)
                     files = [filename] + ([self.prefix + ".tar.gz"] if include_expected else [])
                     self.fixture(root, files)
-                    with self.assertRaisesRegex(ValueError, "unexpected image export"):
+                    with self.assertRaisesRegex(ValueError, "镜像导出文件不符合预期"):
                         verify_artifact(root, self.row)
 
     def test_corrupt_export_fails(self):
@@ -75,7 +75,7 @@ class ArtifactTests(unittest.TestCase):
             root = Path(directory)
             files = self.fixture(root)
             (root / files[0]).write_bytes(b"corrupt")
-            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            with self.assertRaisesRegex(ValueError, "校验和不匹配"):
                 verify_artifact(root, self.row)
 
     def test_missing_export_fails(self):
@@ -83,7 +83,7 @@ class ArtifactTests(unittest.TestCase):
             root = Path(directory)
             files = self.fixture(root)
             (root / files[0]).unlink()
-            with self.assertRaisesRegex(ValueError, "missing or empty"):
+            with self.assertRaisesRegex(ValueError, "导出文件缺失或为空"):
                 verify_artifact(root, self.row)
 
     def test_empty_or_duplicate_export_list_fails(self):
@@ -91,7 +91,7 @@ class ArtifactTests(unittest.TestCase):
             with self.subTest(files=files), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 self.fixture(root, files)
-                with self.assertRaisesRegex(ValueError, "missing or duplicate"):
+                with self.assertRaisesRegex(ValueError, "导出文件缺失或重复"):
                     verify_artifact(root, self.row)
 
     def test_checksum_set_must_exactly_match_exported_files(self):
@@ -112,7 +112,7 @@ class ArtifactTests(unittest.TestCase):
                 else:
                     lines[0] = "invalid checksum entry\n"
                 path.write_text("".join(lines))
-                with self.assertRaisesRegex(ValueError, "checksum"):
+                with self.assertRaisesRegex(ValueError, "校验和"):
                     verify_artifact(root, self.row)
 
     def test_extra_file_fails(self):
@@ -120,7 +120,7 @@ class ArtifactTests(unittest.TestCase):
             root = Path(directory)
             self.fixture(root)
             (root / "stale.tar.xz").write_bytes(b"old")
-            with self.assertRaisesRegex(ValueError, "unexpected or missing"):
+            with self.assertRaisesRegex(ValueError, "产物文件多出或缺失"):
                 verify_artifact(root, self.row)
 
     def test_unsafe_filename_fails(self):
@@ -131,14 +131,14 @@ class ArtifactTests(unittest.TestCase):
             summary = json.loads(path.read_text())
             summary["exported_files"] = ["../outside"]
             path.write_text(json.dumps(summary))
-            with self.assertRaisesRegex(ValueError, "unsafe"):
+            with self.assertRaisesRegex(ValueError, "导出文件名不安全"):
                 verify_artifact(root, self.row)
 
     def test_wrong_architecture_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.fixture(root)
-            with self.assertRaisesRegex(ValueError, "wrong architecture"):
+            with self.assertRaisesRegex(ValueError, "架构不匹配"):
                 verify_artifact(root, {**self.row, "architecture": "arm64"})
 
     def test_downloads_each_artifact_then_removes_directory(self):
@@ -159,5 +159,5 @@ class ArtifactTests(unittest.TestCase):
                  patch("scripts.verify_artifacts.subprocess.run", side_effect=download), \
                  patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(output):
                 self.assertEqual(main(), 0)
-            self.assertIn("Verified 1 architecture/version jobs, 1 images, 1 export files.", output.getvalue())
+            self.assertIn("已校验 1 个架构与版本构建任务、1 个镜像、1 个导出文件。", output.getvalue())
             self.assertFalse(downloaded[0].exists())

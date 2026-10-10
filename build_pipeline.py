@@ -69,16 +69,16 @@ class ImageSpec:
 def load_manifest(path: Path, architecture: str = ARCHITECTURE) -> list[ImageSpec]:
     """Read default container rows for the requested architecture."""
     if architecture not in RUNNERS:
-        raise ValueError("unsupported manifest architecture")
+        raise ValueError("镜像清单中的架构不受支持")
     with path.open("r", encoding="utf-8", newline="") as handle:
         raw = csv.reader(handle, delimiter="\t")
         try:
             fields = [column.split(":", 1)[0].strip() for column in next(raw)]
         except StopIteration:
-            raise ValueError("manifest is empty") from None
+            raise ValueError("镜像清单为空") from None
         required = {"Distribution", "Release", "Architecture", "Variant", "Build date", "Incus (container)"}
         if not required.issubset(fields):
-            raise ValueError("manifest is missing required columns")
+            raise ValueError("镜像清单缺少必要列")
         specs = []
         seen = set()
         for number, row in enumerate(csv.DictReader(handle, fieldnames=fields, delimiter="\t"), 2):
@@ -87,14 +87,14 @@ def load_manifest(path: Path, architecture: str = ARCHITECTURE) -> list[ImageSpe
                 continue
             values = [value(key) for key in ("Distribution", "Release", "Architecture", "Variant", "Build date")]
             if not all(values) or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item) for item in values[:4]):
-                raise ValueError(f"invalid manifest row {number}")
+                raise ValueError(f"镜像清单第 {number} 行无效")
             key = tuple(values[:4])
             if key in seen:
-                raise ValueError(f"duplicate manifest row at line {number}")
+                raise ValueError(f"镜像清单第 {number} 行重复")
             seen.add(key)
             specs.append(ImageSpec(*values))
     if not specs:
-        raise ValueError(f"no {architecture}/default Incus container images found")
+        raise ValueError(f"未找到 {architecture}/default 的 Incus 容器镜像")
     return specs
 
 
@@ -174,11 +174,11 @@ class Pipeline:
     def safe_error(self, exc: BaseException) -> str:
         # Never stringify subprocess exceptions: their command/output can carry secrets.
         if isinstance(exc, subprocess.TimeoutExpired):
-            return "external command timed out"
+            return "外部命令执行超时"
         if isinstance(exc, subprocess.CalledProcessError):
-            return f"external command failed (exit {exc.returncode})"
+            return f"外部命令执行失败，退出码：{exc.returncode}"
         if isinstance(exc, OSError):
-            return "operating system operation failed"
+            return "操作系统操作失败"
         return self.redact_secrets(str(exc))
 
     def redact_secrets(self, text: str) -> str:
@@ -201,9 +201,9 @@ class Pipeline:
         text = "".join(c if c == "\n" or c.isprintable() else ascii(c)[1:-1] for c in text)
         text = text.replace("::", r"\x3a\x3a").replace("##[", r"\x23\x23[")
         lines = text.split("\n")
-        rendered = "\n".join("  setup stderr | " + line for line in lines[:12])
+        rendered = "\n".join("  配置标准错误 | " + line for line in lines[:12])
         if len(rendered) > 2048 or len(lines) > 12:
-            rendered = rendered[:2048] + "\n  setup stderr | [truncated]"
+            rendered = rendered[:2048] + "\n  配置标准错误 | [已截断]"
         return rendered
 
     @staticmethod
@@ -231,39 +231,39 @@ class Pipeline:
 
     def exec_container(self, container: str, command: str, *, quiet: bool = False) -> subprocess.CompletedProcess[str]:
         if not quiet:
-            print(f"  container: {container}")
+            print(f"  容器：{container}")
         return self.incus(["exec", container, "--", "sh", "-c", command], capture=True)
 
     def preflight(self) -> None:
         if len(self.specs) != 1:
-            raise ValueError("each build must select exactly one manifest row")
+            raise ValueError("每次构建必须且只能选择一行镜像清单")
         spec = self.specs[0]
         native = NATIVE_ARCHITECTURES.get(platform.machine().lower())
         if spec.architecture not in RUNNERS or native != spec.architecture:
-            raise RuntimeError(f"a native {spec.architecture} runner is required")
+            raise RuntimeError(f"需要原生 {spec.architecture} 架构的运行器")
         if spec.distro not in {"almalinux", "alpine", "centos", "debian", "ubuntu"}:
-            raise ValueError("unsupported distro")
+            raise ValueError("不支持的发行版")
         if not self.root_password or any(c in self.root_password for c in "\n\r\x00"):
-            raise ValueError("invalid temporary test password")
+            raise ValueError("临时测试密码无效")
         if not math.isfinite(self.ssh_timeout) or self.ssh_timeout <= 0:
-            raise ValueError("SSH timeout must be finite and positive")
+            raise ValueError("SSH 超时时间必须为有限正数")
         if self.output_dir.is_symlink() or (self.output_dir.exists() and
                 (not self.output_dir.is_dir() or any(self.output_dir.iterdir()))):
-            raise RuntimeError("output directory must be absent or empty")
+            raise RuntimeError("输出目录必须不存在或为空")
         for executable in (("incus",) if self.skip_ssh_test else ("incus", "sshpass", "ssh")):
             if shutil.which(executable) is None:
-                raise RuntimeError(f"required executable not found: {executable}")
+                raise RuntimeError(f"未找到必需的可执行文件：{executable}")
         self.incus(["version"])
 
     def download_images(self) -> None:
-        print("[1/8] Downloading base image")
+        print("[1/8] 下载基础镜像")
         for spec in self.specs:
             alias = self.base_alias(spec)
             self.incus(["image", "copy", spec.remote_path(), "local:", "--alias", alias, "--quiet"])
             self.created_base_aliases.append(alias)
 
     def launch_containers(self) -> None:
-        print("[2/8] Creating and starting containers")
+        print("[2/8] 创建并启动容器")
         for spec in self.specs:
             name = self.container_name(spec)
             # init separates successful creation from a potentially failed start.
@@ -282,7 +282,7 @@ class Pipeline:
                 raise
             except RuntimeError:
                 time.sleep(min(2, max(0, deadline - time.monotonic())))
-        raise RuntimeError("container startup timed out")
+        raise RuntimeError("容器启动超时")
 
     @staticmethod
     def ssh_config_command() -> str:
@@ -306,11 +306,11 @@ mv "$config.vpsm" "$config"
                 self.incus(["exec", container, "--", "sh", "-c", command],
                            timeout=timeout, diagnostic_stderr=True)
         except IncusCommandError as exc:
-            raise SetupStepError(f"setup step [{label}] failed: {exc}") from None
+            raise SetupStepError(f"配置步骤 [{label}] 失败：{exc}") from None
 
     def wait_for_package_index(self, container: str, command: str) -> None:
         deadline = time.monotonic() + self.ssh_timeout
-        last_error = "no attempt completed"
+        last_error = "尚无已完成的尝试"
         while (remaining := deadline - time.monotonic()) > 0:
             try:
                 self.setup_step(container, "package-index", command, timeout=min(30, remaining))
@@ -319,11 +319,11 @@ mv "$config.vpsm" "$config"
             else:
                 if time.monotonic() <= deadline:
                     return
-                last_error = "package-index command completed after deadline"
+                last_error = "软件包索引命令完成时已超时"
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(2, remaining))
-        raise SetupStepError(f"setup step [package-index] readiness timed out: {last_error}") from None
+        raise SetupStepError(f"配置步骤 [package-index] 等待就绪超时：{last_error}") from None
 
     def setup_one(self, spec: ImageSpec, container: str) -> None:
         prefix = "set -eu\n"
@@ -338,8 +338,8 @@ mv "$config.vpsm" "$config"
             index, install = "dnf makecache", "dnf install -y openssh-server"
             services = [("ssh-enable", "systemctl enable sshd"), ("ssh-restart", "systemctl restart sshd")]
         else:
-            raise ValueError("unsupported distro in setup stage")
-        print(f"  container: {container}")
+            raise ValueError("配置阶段不支持此发行版")
+        print(f"  容器：{container}")
         # Retry only the idempotent index refresh, not installation or SSH/password setup.
         self.wait_for_package_index(container, prefix + index)
         for label, command in [
@@ -350,7 +350,7 @@ mv "$config.vpsm" "$config"
         self.setup_step(container, "chpasswd")
 
     def setup_containers(self) -> None:
-        print("[3/8] Installing and configuring SSH")
+        print("[3/8] 安装并配置 SSH")
         for spec in self.specs:
             self.setup_one(spec, self.container_name(spec))
 
@@ -365,22 +365,22 @@ mv "$config.vpsm" "$config"
         if spec.distro in {"almalinux", "centos"}:
             major = spec.release.split("-", 1)[0].split(".", 1)[0]
             if major not in {"8", "9", "10"}:
-                raise ValueError("unsupported Enterprise Linux version")
+                raise ValueError("不支持的 Enterprise Linux 版本")
             repo = "powertools" if major == "8" else "crb"
             epel = (f"https://dl.fedoraproject.org/pub/epel/epel-release-latest-{major}.noarch.rpm"
                     if spec.distro == "centos" else "epel-release")
             return (f"set -eu\ndnf install -y dnf-plugins-core\ndnf config-manager --set-enabled {repo}\n"
                     f"dnf install -y {epel}\ndnf install -y {COMMON_PACKAGES}\n"
                     "update-ca-trust extract\ntest -s /etc/pki/tls/certs/ca-bundle.crt")
-        raise ValueError("unsupported distro in package stage")
+        raise ValueError("软件包安装阶段不支持此发行版")
 
     def install_common_packages(self) -> None:
-        print("[4/8] Installing common packages")
+        print("[4/8] 安装常用软件包")
         for spec in self.specs:
             self.exec_container(self.container_name(spec), self.package_install_command(spec))
 
     def write_readmes(self) -> None:
-        print("[5/8] Writing image README files")
+        print("[5/8] 写入镜像说明文件")
         for container in self.containers:
             self.exec_container(container, f"printf '%s\\n' {shell_quote(README_CONTENT)} > /root/README.md", quiet=True)
 
@@ -401,9 +401,9 @@ mv "$config.vpsm" "$config"
 
     def test_ssh(self) -> None:
         if self.skip_ssh_test:
-            print("[6/8] Skipping SSH test")
+            print("[6/8] 跳过 SSH 测试")
             return
-        print("[6/8] Waiting for SSH and testing temporary credentials")
+        print("[6/8] 等待 SSH 就绪并测试临时凭据")
         environment = self.command_environment()
         environment["SSHPASS"] = self.root_password
         for container in self.containers:
@@ -427,8 +427,8 @@ mv "$config.vpsm" "$config"
                     pass  # Retry without exposing remote output or credential-bearing errors.
                 time.sleep(min(2, max(0, deadline - time.monotonic())))
             else:
-                raise RuntimeError(f"SSH readiness/authentication timed out: {container}")
-            print(f"  {container}: OK")
+                raise RuntimeError(f"SSH 等待就绪或身份验证超时：{container}")
+            print(f"  {container}：通过")
 
     @staticmethod
     def first_boot_identity_command(spec: ImageSpec) -> str:
@@ -438,7 +438,7 @@ mv "$config.vpsm" "$config"
             return """set -eu
 cat > /etc/init.d/vpsm-firstboot <<'EOF'
 #!/sbin/openrc-run
-description="Initialize missing container identities"
+description="初始化缺失的容器身份标识"
 depend() {
     need localmount
     before networking sshd dbus machine-id
@@ -466,7 +466,7 @@ done
         return """set -eu
 cat > /etc/systemd/system/vpsm-firstboot.service <<'EOF'
 [Unit]
-Description=Initialize missing SSH host keys
+Description=初始化缺失的 SSH 主机密钥
 # Socket units precede basic.target. Default service dependencies would cycle.
 DefaultDependencies=no
 After=local-fs.target
@@ -495,9 +495,15 @@ systemctl enable vpsm-firstboot.service
 """
 
     def cleanup_containers(self) -> None:
-        print("[7/8] Removing test credentials and caches; locking root")
+        print("[7/8] 清除测试凭据和缓存，锁定 root 账户")
         common = """set -eu
 printf 'root:!\\n' | chpasswd -e
+for conf in /usr/lib/tmpfiles.d/*.conf /etc/tmpfiles.d/*.conf; do
+    test -e "$conf" || continue
+    if grep -q -F '/root/.ssh' "$conf"; then
+        sed -i -e '\\%/root/[.]ssh%d' "$conf"
+    fi
+done
 # Remove account backups as well as login/test state; never remove live databases.
 for path in /etc/shadow- /etc/shadow~ /etc/shadow.bak \\
             /etc/gshadow- /etc/gshadow~ /etc/gshadow.bak \\
@@ -562,6 +568,29 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
 """
             self.exec_container(container, common + "\n" + package_cleanup + "\n"
                                 + self.first_boot_identity_command(spec) + stop_ssh + identity_cleanup, quiet=True)
+            residuals = self.exec_container(container, """set -eu
+for path in /etc/shadow- /etc/shadow~ /etc/shadow.bak \\
+            /etc/gshadow- /etc/gshadow~ /etc/gshadow.bak \\
+            /etc/passwd- /etc/passwd~ /etc/passwd.bak \\
+            /etc/group- /etc/group~ /etc/group.bak \\
+            /var/backups/shadow* /var/backups/gshadow* \\
+            /var/backups/passwd* /var/backups/group* \\
+            /root/.ssh /root/.bash_history /root/.ash_history /root/.zsh_history; do
+    if test -e "$path" || test -L "$path"; then
+        printf '%s\\n' "$path"
+    fi
+done
+for conf in /usr/lib/tmpfiles.d/*.conf /etc/tmpfiles.d/*.conf; do
+    test -e "$conf" || continue
+    if grep -q -F '/root/.ssh' "$conf"; then
+        printf '%s\\n' "$conf"
+    fi
+done
+""")
+            if residuals.stdout.strip():
+                error = "最终清理复核发现残留路径：\n" + self.safe_setup_stderr(residuals.stdout)
+                print(error, file=sys.stderr)
+                raise RuntimeError(error)
             self.sanitized_containers.add(container)
 
     def write_checksums(self) -> None:
@@ -569,7 +598,7 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
         for name in self.exported_files:
             path = self.output_dir / name
             if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
-                raise RuntimeError("exported image is missing or empty")
+                raise RuntimeError("导出的镜像缺失或为空")
             digest = hashlib.sha256()
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -578,11 +607,11 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
         (self.output_dir / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
 
     def publish_and_export(self) -> None:
-        print("[8/8] Publishing and exporting images")
+        print("[8/8] 发布并导出镜像")
         for spec in self.specs:
             container = self.container_name(spec)
             if container not in self.sanitized_containers:
-                raise RuntimeError("refusing to publish before test credentials are removed")
+                raise RuntimeError("测试凭据尚未清除，拒绝发布")
             self.incus(["stop", container, "--force"])
             # Reset the backing file with the guest STOPPED: PID 1 may otherwise
             # commit its runtime machine-id after a live truncate. Incus mounts
@@ -599,17 +628,17 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
                 files = sorted(Path(directory).iterdir())
                 if not files or any(path.is_symlink() or not path.is_file() or path.stat().st_size == 0
                                     or not (path.name == output_name or path.name.startswith(output_name + ".")) for path in files):
-                    raise RuntimeError(f"missing, empty or invalid export: {output_name}")
+                    raise RuntimeError(f"导出文件缺失、为空或无效：{output_name}")
                 # Incus explicit-target exports: unified target.tar.* OR split
                 # target + target.root. A lone extensionless metadata file is
                 # not a complete image. Keep the actual filenames, no guesses.
                 suffixes = {path.name[len(output_name):] for path in files}
                 if not valid_export_suffixes(suffixes):
-                    raise RuntimeError(f"unexpected export file set: {output_name}")
+                    raise RuntimeError(f"导出文件组合不符合预期：{output_name}")
                 for path in files:
                     destination = self.output_dir / path.name
                     if destination.exists() or destination.is_symlink():
-                        raise RuntimeError("refusing to overwrite an existing artifact")
+                        raise RuntimeError("拒绝覆盖已有产物")
                     # Link is atomic and refuses overwrite; temp and output share a filesystem.
                     os.link(path, destination)
                     self.exported_files.append(path.name)
@@ -618,7 +647,7 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
 
     def final_cleanup(self) -> None:
         if self.keep_resources:
-            print("Keeping created Incus resources (--keep-resources)")
+            print("已启用 --keep-resources，保留创建的 Incus 资源")
             return
         # No predicted names and no fingerprint deletion: copied/published blobs can be shared.
         for name in reversed(self.created_containers[:]):
@@ -626,14 +655,14 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
                 self.incus(["delete", name, "--force"], timeout=60)
                 self.created_containers.remove(name)
             except Exception:
-                print("WARNING: temporary container cleanup failed", file=sys.stderr)
+                print("[注意] 临时容器清理失败", file=sys.stderr)
         for aliases in (self.created_published_aliases, self.created_base_aliases):
             for alias in reversed(aliases[:]):
                 try:
                     self.incus(["image", "alias", "delete", alias], timeout=60)
                     aliases.remove(alias)
                 except Exception:
-                    print("WARNING: temporary image alias cleanup failed", file=sys.stderr)
+                    print("[注意] 临时镜像别名清理失败", file=sys.stderr)
 
     def write_summary(self, status: str, error: str | None = None) -> None:
         payload = {
@@ -650,13 +679,19 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
         summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_file:
             with open(summary_file, "a", encoding="utf-8") as handle:
-                handle.write(f"## Incus image build\n\n- Status: **{status}**\n- Architecture: **{self.specs[0].architecture}**\n")
+                display_status = {"success": "成功", "failed": "失败"}.get(status, status)
+                handle.write(f"## Incus 镜像构建\n\n- 状态：**{display_status}**\n- 架构：**{self.specs[0].architecture}**\n")
                 for name in payload["exported_files"]:
                     handle.write(f"- `{name}`\n")
+                if error:
+                    detail = self.safe_setup_stderr(error)
+                    handle.write("\n### 失败原因\n\n")
+                    for line in detail.splitlines():
+                        handle.write("> " + line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "\n")
 
     @staticmethod
     def _handle_sigterm(signum: int, frame: object) -> None:
-        raise BuildTerminated("build interrupted by SIGTERM")
+        raise BuildTerminated("构建被 SIGTERM 信号中断")
 
     def run(self) -> None:
         status = "failed"
@@ -669,7 +704,7 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
             ready = True
             self.output_dir.mkdir(parents=True, exist_ok=True)
             if any(self.output_dir.iterdir()):
-                raise RuntimeError("output directory must be empty")
+                raise RuntimeError("输出目录必须为空")
             self.output_ready = True
             self.download_images()
             self.launch_containers()
@@ -697,28 +732,34 @@ ln -s /etc/machine-id /var/lib/dbus/machine-id
                         self.write_summary(status, error)
                     except Exception:
                         if error is None:
-                            raise RuntimeError("could not write build summary") from None
-                        print("WARNING: could not write failure summary", file=sys.stderr)
+                            raise RuntimeError("无法写入构建摘要") from None
+                        print("[注意] 无法写入失败摘要", file=sys.stderr)
             finally:
                 signal.signal(signal.SIGTERM, previous_handler)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, default=Path("镜像.md"))
-    parser.add_argument("--output-dir", type=Path, default=Path("dist"))
-    parser.add_argument("--matrix", action="store_true")
-    parser.add_argument("--architecture", choices=tuple(RUNNERS))
-    parser.add_argument("--distro")
-    parser.add_argument("--release")
-    parser.add_argument("--keep-resources", action="store_true")
-    parser.add_argument("--skip-ssh-test", action="store_true")
-    parser.add_argument("--ssh-timeout", type=float, default=120)
+    parser = argparse.ArgumentParser(
+        description="在 Linux 运行器上构建预装常用软件包的单个原生架构 Incus 镜像。"
+        "--matrix 仅输出构建矩阵，无需 Incus 或凭据。构建密码随机生成且仅供临时测试，发布镜像的 root 账户保持锁定。"
+        "需要提升 Incus 访问权限时，请通过 sudo --preserve-env 调用。",
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
+    parser.add_argument("--manifest", type=Path, default=Path("镜像.md"), help="镜像清单路径，默认：镜像.md")
+    parser.add_argument("--output-dir", type=Path, default=Path("dist"), help="产物输出目录，默认：dist")
+    parser.add_argument("--matrix", action="store_true", help="仅输出构建矩阵，不执行构建")
+    parser.add_argument("--architecture", choices=tuple(RUNNERS), help="目标架构，必须与运行器原生架构一致")
+    parser.add_argument("--distro", help="目标发行版")
+    parser.add_argument("--release", help="目标发行版本")
+    parser.add_argument("--keep-resources", action="store_true", help="构建结束后保留创建的 Incus 资源")
+    parser.add_argument("--skip-ssh-test", action="store_true", help="跳过 SSH 登录测试")
+    parser.add_argument("--ssh-timeout", type=float, default=120, help="SSH 就绪及相关等待的超时秒数，默认：120")
     parser.add_argument("--setup-diagnostics", action="store_true",
-                        help="include bounded, redacted stderr for credential-free setup failures")
+                        help="无凭据配置步骤失败时，附加限长且已脱敏的标准错误输出")
     args = parser.parse_args(argv)
     if not args.matrix and not all((args.architecture, args.distro, args.release)):
-        parser.error("build requires --architecture, --distro and --release")
+        parser.error("构建必须指定 --architecture、--distro 和 --release")
     return args
 
 
@@ -733,14 +774,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         specs = [spec for spec in load_manifest(args.manifest, args.architecture)
                  if spec.distro == args.distro and spec.release == args.release]
         if len(specs) != 1:
-            raise ValueError("selection must match exactly one manifest row")
+            raise ValueError("筛选条件必须且只能匹配一行镜像清单")
         # Never use a GitHub Secret as a published (or test) image password.
         Pipeline(specs, args.output_dir, keep_resources=args.keep_resources,
                  skip_ssh_test=args.skip_ssh_test, ssh_timeout=args.ssh_timeout,
                  setup_diagnostics=args.setup_diagnostics).run()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         # Detailed sanitized errors are in build-summary.json when a build started.
-        print("Build failed; see build-summary.json if created (no credentials logged).", file=sys.stderr)
+        print("构建失败；如已生成 build-summary.json，请查看该文件。日志不记录凭据。", file=sys.stderr)
         return 1
     return 0
 
