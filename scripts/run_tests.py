@@ -30,12 +30,20 @@ class ChineseTestResult(unittest.TestResult):
             self.test_numbers[test_id] = len(self.test_numbers) + 1
         module_name = parent.__class__.__module__.rsplit(".", 1)[-1]
         group_name = TEST_GROUP_NAMES.get(module_name, "测试用例")
-        return f"用例{self.test_numbers[test_id]:03d}：{group_name}"
+        label = f"用例{self.test_numbers[test_id]:03d}：{group_name}"
+        if test is parent:
+            return f"{label} {test_id}"
+        return f"{label} {test._subDescription().strip('()')}"
 
     def write_status(self, status, test, detail=""):
         suffix = f"，{detail}" if detail else ""
         self.stream.write(f"[{status}] {self.describe_test(test)}{suffix}\n")
         self.stream.flush()
+
+    def _setupStdout(self):
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        super()._setupStdout()
 
     def startTest(self, test):
         super().startTest(test)
