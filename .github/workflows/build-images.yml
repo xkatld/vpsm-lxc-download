@@ -28,7 +28,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: 检查语法并运行测试
@@ -47,7 +47,7 @@ jobs:
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$matrix" > build-matrix.json
       - name: 上传构建矩阵
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-matrix
           path: build-matrix.json
@@ -70,7 +70,7 @@ jobs:
       TARGET_RELEASE: ${{ matrix.release }}
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: 安装并初始化 Incus
@@ -106,7 +106,7 @@ jobs:
           fi
       - name: 上传验收报告
         if: ${{ always() && steps.acceptance.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: acceptance-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
           path: acceptance/
@@ -117,7 +117,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist
           chmod -R u+rwX dist
       - name: 上传已验收的镜像文件
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: images-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
           path: dist/
@@ -144,7 +144,7 @@ jobs:
           fi
       - name: 上传诊断信息
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: diagnostics-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.architecture }}
           path: diagnostics/
@@ -160,7 +160,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: 确认所有矩阵任务通过
@@ -173,7 +173,7 @@ jobs:
           fi
           printf '[通过] 所有镜像矩阵任务均已通过。\n'
       - name: 下载构建矩阵
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: build-matrix
           path: expected
