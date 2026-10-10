@@ -26,9 +26,9 @@ SUDO_STUB = textwrap.dedent(r'''
 
     args = sys.argv[1:]
     root = Path(os.environ["INCUS_TEST_ROOT"])
-    preseed = sys.stdin.read() if args == ["incus", "admin", "init", "--preseed"] else None
+    stdin_data = sys.stdin.read()
     with (root / "commands.jsonl").open("a", encoding="utf-8") as log:
-        log.write(json.dumps({"args": args, "stdin": preseed}) + "\n")
+        log.write(json.dumps({"args": args, "stdin": stdin_data}) + "\n")
 
     def fail(message, status):
         print(message, file=sys.stderr)
@@ -41,6 +41,11 @@ SUDO_STUB = textwrap.dedent(r'''
     state = root / "remotes.json"
     allowed = [
         ["apt-get", "update"],
+        ["DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "curl", "ca-certificates"],
+        ["install", "-d", "-m", "0755", "/etc/apt/keyrings"],
+        ["curl", "-fsSL", "https://pkgs.zabbly.com/key.asc", "-o", "/etc/apt/keyrings/zabbly.asc"],
+        ["chmod", "0644", "/etc/apt/keyrings/zabbly.asc"],
+        ["tee", "/etc/apt/sources.list.d/zabbly-incus-stable.list"],
         ["DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
          "incus", "openssh-client", "sshpass", "openssl", "ca-certificates"],
         ["systemctl", "start", "incus"],
@@ -73,6 +78,9 @@ SUDO_STUB = textwrap.dedent(r'''
             "Public": True,
         }
         state.write_text(json.dumps(remotes), encoding="utf-8")
+    elif args == ["incus", "version"]:
+        print("Client version: " + config["incus_version"])
+        print("Server version: " + config["incus_version"])
     elif args in allowed:
         pass
     else:
@@ -90,7 +98,7 @@ def image_remote():
 
 class SetupIncusTests(unittest.TestCase):
     def run_setup(self, remotes, *, list_failure=False, malformed_json=False,
-                  add_failure=False):
+                  add_failure=False, incus_version="7.5.1"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bin_dir = root / "bin"
@@ -105,6 +113,7 @@ class SetupIncusTests(unittest.TestCase):
                 "list_failure": list_failure,
                 "malformed_json": malformed_json,
                 "add_failure": add_failure,
+                "incus_version": incus_version,
             }), encoding="utf-8")
             (root / "remotes.json").write_text(json.dumps(remotes), encoding="utf-8")
             env = os.environ.copy()
@@ -205,6 +214,28 @@ class SetupIncusTests(unittest.TestCase):
         self.assertEqual(commands.count(REMOTE_ADD), 1)
         self.assertIn("simulated remote add failure", result.stderr)
         self.assertEqual(commands[-1], REMOTE_ADD)
+
+    def test_zabbly_repository_installs_incus_75(self):
+        result, commands, records, state = self.run_setup({"images": image_remote()})
+        self.assert_success(result, commands)
+        self.assertEqual(commands.count(["apt-get", "update"]), 2)
+        self.assertIn(["install", "-d", "-m", "0755", "/etc/apt/keyrings"], commands)
+        self.assertIn(["chmod", "0644", "/etc/apt/keyrings/zabbly.asc"], commands)
+        self.assertIn(
+            ["curl", "-fsSL", "https://pkgs.zabbly.com/key.asc", "-o", "/etc/apt/keyrings/zabbly.asc"],
+            commands,
+        )
+        tee_records = [record for record in records
+                       if record["args"] == ["tee", "/etc/apt/sources.list.d/zabbly-incus-stable.list"]]
+        self.assertEqual(len(tee_records), 1)
+        self.assertIn("https://pkgs.zabbly.com/incus/stable noble main", tee_records[0]["stdin"])
+        self.assertIn("signed-by=/etc/apt/keyrings/zabbly.asc", tee_records[0]["stdin"])
+
+    def test_older_incus_version_aborts(self):
+        result, commands, _, state = self.run_setup({"images": image_remote()}, incus_version="6.0.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("需要 Incus 7.5", result.stderr)
+        self.assertEqual(commands[-1], ["incus", "version"])
 
 
 if __name__ == "__main__":
