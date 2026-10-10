@@ -2,12 +2,13 @@ import contextlib
 import hashlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.verify_artifacts import main, verify_artifact
+from scripts.verify_artifacts import main, release_configured, verify_artifact
 
 
 class ArtifactTests(unittest.TestCase):
@@ -161,3 +162,77 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(main(), 0)
             self.assertIn("已校验 1 个架构与版本构建任务、1 个镜像、1 个导出文件。", output.getvalue())
             self.assertFalse(downloaded[0].exists())
+
+    def test_release_configured_requires_repo_tag_and_token(self):
+        self.assertTrue(release_configured("xkatld/vpsm", "lxc-images", "token"))
+        for repo, tag, token in (("", "lxc-images", "token"), ("xkatld/vpsm", "", "token"),
+                                 ("xkatld/vpsm", "lxc-images", "")):
+            with self.subTest(repo=repo, tag=tag, token=token):
+                self.assertFalse(release_configured(repo, tag, token))
+
+    def run_main(self, matrix, extra_args, environment, release_exists=True):
+        uploads, created, commands = [], [], []
+
+        def run(command, **kwargs):
+            commands.append(list(command))
+            if command[:3] == ["gh", "run", "download"]:
+                self.fixture(Path(command[command.index("--dir") + 1]))
+            elif command[:3] == ["gh", "release", "view"]:
+                return subprocess.CompletedProcess(command, 0 if release_exists else 1, "", "")
+            elif command[:3] == ["gh", "release", "create"]:
+                created.append(list(command))
+            elif command[:3] == ["gh", "release", "upload"]:
+                self.assertEqual(kwargs.get("env", {}).get("GH_TOKEN"), environment.get("RELEASE_TOKEN"))
+                uploads.append(list(command))
+            else:
+                self.fail("unexpected command: " + " ".join(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        output = io.StringIO()
+        argv = ["verify", "--matrix", str(matrix), "--run-id", "123", *extra_args]
+        with patch("sys.argv", argv), \
+             patch("scripts.verify_artifacts.subprocess.run", side_effect=run), \
+             patch.dict("os.environ", environment, clear=True), contextlib.redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        return uploads, created, commands, output.getvalue()
+
+    def test_publishes_each_artifact_and_combined_checksums(self):
+        with tempfile.TemporaryDirectory() as directory:
+            matrix = Path(directory) / "matrix.json"
+            matrix.write_text(json.dumps({"include": [self.row]}))
+            uploads, created, commands, _ = self.run_main(
+                matrix, ["--release-repo", "xkatld/vpsm", "--release-tag", "lxc-images"],
+                {"RELEASE_TOKEN": "secret-token"},
+            )
+        self.assertEqual(created, [])
+        self.assertEqual(commands.count(["gh", "release", "view", "lxc-images", "--repo", "xkatld/vpsm"]), 1)
+        self.assertEqual(len(uploads), 2)
+        for upload in uploads:
+            self.assertEqual(upload[3], "lxc-images")
+            self.assertEqual(upload[-3:], ["--repo", "xkatld/vpsm", "--clobber"])
+        self.assertTrue(uploads[0][4].endswith(self.prefix + ".tar.gz"))
+        self.assertTrue(uploads[1][4].endswith("SHA256SUMS"))
+
+    def test_release_is_created_when_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            matrix = Path(directory) / "matrix.json"
+            matrix.write_text(json.dumps({"include": [self.row]}))
+            _, created, _, _ = self.run_main(
+                matrix, ["--release-repo", "xkatld/vpsm", "--release-tag", "lxc-images"],
+                {"RELEASE_TOKEN": "secret-token"}, release_exists=False,
+            )
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0][:3], ["gh", "release", "create"])
+        self.assertIn("--notes", created[0])
+
+    def test_release_skipped_without_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            matrix = Path(directory) / "matrix.json"
+            matrix.write_text(json.dumps({"include": [self.row]}))
+            uploads, created, commands, output = self.run_main(
+                matrix, ["--release-repo", "xkatld/vpsm", "--release-tag", "lxc-images"], {},
+            )
+        self.assertEqual(uploads, [])
+        self.assertEqual(created, [])
+        self.assertFalse(any(command[:2] == ["gh", "release"] for command in commands))
+        self.assertIn("跳过发布", output)

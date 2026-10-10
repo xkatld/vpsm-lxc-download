@@ -177,10 +177,14 @@ jobs:
         with:
           name: build-matrix
           path: expected
-      # Download/verify/delete one artifact at a time instead of filling a runner
-      # with all 30 images. Image artifacts remain available from this run.
+      # Download/verify/publish/delete one artifact at a time instead of filling a
+      # runner with all 30 images. Image artifacts remain available from this run.
       - name: 验证校验和及预期产物
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: python3 scripts/verify_artifacts.py --matrix expected/build-matrix.json --run-id "$GITHUB_RUN_ID"
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          python3 scripts/verify_artifacts.py --matrix expected/build-matrix.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --release-repo xkatld/vpsm --release-tag lxc-images

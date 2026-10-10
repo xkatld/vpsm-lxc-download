@@ -33,6 +33,11 @@ class RepositoryConfigTests(unittest.TestCase):
         self.assertIn("path: acceptance/", text)
         self.assertNotIn("continue-on-error", text)
 
+    def test_release_publish_uses_optional_token(self):
+        text = (ROOT / ".github/workflows/build-images.yml").read_text()
+        self.assertIn("RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}", text)
+        self.assertIn("--release-repo xkatld/vpsm --release-tag lxc-images", text)
+
     def test_manifest_has_matching_versions_for_both_architectures(self):
         with (ROOT / "镜像.md").open() as handle:
             rows = list(csv.reader(handle, delimiter="\t"))[1:]

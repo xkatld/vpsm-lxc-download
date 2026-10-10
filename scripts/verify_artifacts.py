@@ -63,11 +63,32 @@ def verify_artifact(root: Path, expected: dict) -> int:
     return len(files)
 
 
+def release_configured(repo: str | None, tag: str | None, token: str) -> bool:
+    return bool(repo and tag and token)
+
+
+def ensure_release(repo: str, tag: str, token: str) -> None:
+    env = dict(os.environ, GH_TOKEN=token)
+    view = subprocess.run(["gh", "release", "view", tag, "--repo", repo],
+                          capture_output=True, text=True, env=env, timeout=120)
+    if view.returncode != 0:
+        subprocess.run(["gh", "release", "create", tag, "--repo", repo,
+                        "--title", tag, "--notes", ""], check=True, env=env, timeout=120)
+
+
+def upload_assets(repo: str, tag: str, token: str, files: list[Path]) -> None:
+    env = dict(os.environ, GH_TOKEN=token)
+    subprocess.run(["gh", "release", "upload", tag, *(str(path) for path in files),
+                    "--repo", repo, "--clobber"], check=True, env=env, timeout=1800)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="逐个校验本次运行的镜像产物，限制磁盘占用。", add_help=False)
     parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
     parser.add_argument("--matrix", type=Path, required=True, help="预期构建矩阵文件路径")
     parser.add_argument("--run-id", required=True, help="待校验产物所属的工作流运行编号")
+    parser.add_argument("--release-repo", help="发布目标仓库 owner/name")
+    parser.add_argument("--release-tag", help="发布目标标签")
     args = parser.parse_args()
     rows = json.loads(args.matrix.read_text(encoding="utf-8"))["include"]
     if not rows:
@@ -75,16 +96,33 @@ def main() -> int:
     names = [f"images-{r['distro']}-{r['release']}-{r['architecture']}" for r in rows]
     if len(names) != len(set(names)):
         raise ValueError("预期产物名称重复")
+    token = os.environ.get("RELEASE_TOKEN", "")
+    publish = release_configured(args.release_repo, args.release_tag, token)
+    if publish:
+        ensure_release(args.release_repo, args.release_tag, token)
+    checksum_lines: list[str] = []
     total = 0
     for row, name in zip(rows, names):
         with tempfile.TemporaryDirectory(prefix="vpsm-verify-") as directory:
+            root = Path(directory)
             subprocess.run(
                 ["gh", "run", "download", args.run_id, "--name", name, "--dir", directory],
                 check=True, timeout=1200,
             )
-            count = verify_artifact(Path(directory), row)
+            count = verify_artifact(root, row)
             total += count
+            if publish:
+                exported = json.loads((root / "build-summary.json").read_text(encoding="utf-8"))["exported_files"]
+                upload_assets(args.release_repo, args.release_tag, token, [root / item for item in exported])
+                checksum_lines.extend((root / "SHA256SUMS").read_text(encoding="utf-8").splitlines(keepends=True))
             print(f"已校验 {name}：{count} 个文件")
+    if publish:
+        with tempfile.TemporaryDirectory(prefix="vpsm-release-") as directory:
+            combined = Path(directory) / "SHA256SUMS"
+            combined.write_text("".join(checksum_lines), encoding="utf-8")
+            upload_assets(args.release_repo, args.release_tag, token, [combined])
+    else:
+        print("[注意] 未配置发布目标或 RELEASE_TOKEN，跳过发布")
     report = f"已校验 {len(rows)} 个架构与版本构建任务、{len(rows)} 个镜像、{total} 个导出文件。"
     print(report)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
